@@ -3004,6 +3004,7 @@ function ExampleForm({
   const [forClasses, setForClasses] = useState(existing?.forClasses || []);
   const [forCourseIds, setForCourseIds] = useState(existing?.forCourseIds || []);
   const save = () => {
+    let createdId = null;
     if (existing) {
       update(d => {
         const idx = d.examples.findIndex(e => e.id === editId);
@@ -3041,10 +3042,11 @@ function ExampleForm({
           workTitle: isTropeWalk ? workTitle : ""
         });
         d.examples.push(ex);
+        createdId = ex.id;
         return d;
       });
     }
-    onDone();
+    onDone(createdId);
   };
   return /*#__PURE__*/React.createElement("div", null, isTropeWalk && /*#__PURE__*/React.createElement("div", {
     className: "row wrap",
@@ -3201,7 +3203,7 @@ function ExampleForm({
     }
   }, /*#__PURE__*/React.createElement(Btn, {
     kind: "ghost",
-    onClick: onDone
+    onClick: () => onDone(null)
   }, "\u041E\u0442\u043C\u0435\u043D\u0430"), /*#__PURE__*/React.createElement(Btn, {
     kind: "primary",
     onClick: save
@@ -6339,6 +6341,98 @@ function MaterialPeekModal({
     }
   }))));
 }
+
+// Кнопка с выпадающим списком. items: [{ key, label, hint?, sep? }]; onPick(key) вызывается при выборе пункта.
+function PopMenu({
+  label,
+  kind = "ghost",
+  sm,
+  items,
+  onPick,
+  title,
+  selectedKey
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef(null);
+  useEffect(() => {
+    if (!open) return undefined;
+    const h = e => {
+      if (ref.current && !ref.current.contains(e.target)) setOpen(false);
+    };
+    const k = e => {
+      if (e.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", h);
+    document.addEventListener("keydown", k);
+    return () => {
+      document.removeEventListener("mousedown", h);
+      document.removeEventListener("keydown", k);
+    };
+  }, [open]);
+  return /*#__PURE__*/React.createElement("span", {
+    ref: ref,
+    style: {
+      position: "relative",
+      display: "inline-block"
+    }
+  }, /*#__PURE__*/React.createElement(Btn, {
+    kind: kind,
+    sm: sm,
+    title: title,
+    onClick: () => setOpen(v => !v)
+  }, label, " \u25BE"), open && /*#__PURE__*/React.createElement("div", {
+    className: "pm-menu"
+  }, items.map(it => it.sep ? /*#__PURE__*/React.createElement("div", {
+    key: it.key,
+    className: "pm-sep"
+  }) : /*#__PURE__*/React.createElement("div", {
+    key: it.key,
+    className: "pm-item" + (selectedKey === it.key ? " sel" : ""),
+    onClick: () => {
+      setOpen(false);
+      onPick(it.key);
+    }
+  }, /*#__PURE__*/React.createElement("span", null, it.label), it.hint ? /*#__PURE__*/React.createElement("span", {
+    className: "pm-hint"
+  }, it.hint) : null))));
+}
+const PICKER_SECTIONS = [{
+  type: "exercise",
+  label: "Упражнения",
+  icon: "📝"
+}, {
+  type: "theory",
+  label: "История и теория",
+  icon: "📚"
+}, {
+  type: "personality",
+  label: "Персоналии",
+  icon: "👤"
+}, {
+  type: "work",
+  label: "Произведения",
+  icon: "📖"
+}];
+const NEW_MATERIAL_LABEL = {
+  exercise: "Упражнение",
+  theory: "История / теория",
+  personality: "Персоналия",
+  work: "Произведение"
+};
+// Текст, по которому ищем материал: для упражнений — весь текст, примечание, вид, название; для остальных — название, автор, метки.
+function materialSearchText(data, type, e, tagNames) {
+  const tags = (e.tagIds || []).map(id => tagNames.get(id) || "").join(" ");
+  if (type === "exercise") {
+    const t = (data.tags.exerciseType || []).find(x => x.id === e.typeTagId);
+    const a = e.authorId ? (data.personalities.find(p => p.id === e.authorId) || {}).title || "" : "";
+    return (stripHtml(e.text || "") + " " + (e.note || "") + " " + (t ? t.name : "") + " " + (e.workTitle || "") + " " + a + " " + tags).toLowerCase();
+  }
+  const a = type === "work" && e.authorId ? (data.personalities.find(p => p.id === e.authorId) || {}).title || "" : "";
+  return ((e.title || "") + " " + a + " " + tags).toLowerCase();
+}
+
+// «Выбрать материалы»: выпадающий список разделов (упражнения, теория, персоналии, произведения) → список материалов раздела
+// с поиском; либо поиск сразу по всем разделам. extra — дополнительные кнопки в той же строке (например, «Создать материал»).
 function ItemPicker({
   data,
   lesson,
@@ -6347,113 +6441,168 @@ function ItemPicker({
   onRemoveItems,
   onAddWhole,
   onAddExercise,
-  onRemoveItem
+  onRemoveItem,
+  extra
 }) {
-  const [type, setType] = useState("exercise");
+  const [type, setType] = useState(null); // null — свёрнуто; "all" — поиск по всем разделам; иначе тип материала
   const [q, setQ] = useState("");
-  const [expandedId, setExpandedId] = useState(null);
+  const [exType, setExType] = useState("");
+  const [expandedKey, setExpandedKey] = useState(null);
   const [showHidden, setShowHidden] = useState(false);
-  const meta = ITEM_TYPE_META[type];
   const findItem = pred => lesson.items.find(pred);
   const lessonCtx = {
     class: lesson.class,
     courseId: lesson.courseId,
     classLetterId: lesson.classLetterId || null
   };
-  const inLesson = e => !!findItem(it => it.type === type && it.refId === e.id || it.type === "question" && it.entityType === type && it.entityId === e.id);
-  const hiddenReason = e => inLesson(e) ? null : materialHiddenReason(data, type, e, lessonCtx, lesson.id);
-  let list = (data[meta.dataKey] || []).filter(e => meta.titleOf(data, e).toLowerCase().includes(q.toLowerCase()));
-  const searching = q.trim().length > 0;
-  const hiddenCount = searching ? 0 : list.filter(e => hiddenReason(e)).length;
-  if (!showHidden && !searching) list = list.filter(e => !hiddenReason(e));
   const ctxLabel = scopeLabelOf(data, scopeKeyOf(lessonCtx));
-  return /*#__PURE__*/React.createElement("div", {
-    className: "addbox",
-    style: {
-      flexDirection: "column",
-      alignItems: "stretch"
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    className: "row wrap"
-  }, /*#__PURE__*/React.createElement("div", {
-    className: "seg"
-  }, Object.entries(ITEM_TYPE_META).map(([k, m]) => /*#__PURE__*/React.createElement("button", {
-    key: k,
-    "aria-pressed": type === k ? "true" : undefined,
-    onClick: () => {
-      setType(k);
-      setQ("");
-      setExpandedId(null);
-    }
-  }, m.label))), /*#__PURE__*/React.createElement("input", {
-    value: q,
-    onChange: e => setQ(e.target.value),
-    placeholder: "\u041F\u043E\u0438\u0441\u043A\u2026",
-    style: {
-      flex: 1,
-      minWidth: 140
-    }
-  })), hiddenCount > 0 && /*#__PURE__*/React.createElement("div", {
+  const tagNames = new Map();
+  Object.values(data.tags || {}).forEach(arr => Array.isArray(arr) && arr.forEach(t => t && t.id && tagNames.set(t.id, t.name || "")));
+  const inLesson = (t, e) => !!findItem(it => it.type === t && it.refId === e.id || it.type === "question" && it.entityType === t && it.entityId === e.id);
+  const hiddenReason = (t, e) => inLesson(t, e) ? null : materialHiddenReason(data, t, e, lessonCtx, lesson.id);
+  const choose = k => {
+    setType(k);
+    setQ("");
+    setExType("");
+    setExpandedKey(null);
+    setShowHidden(false);
+  };
+  const counts = Object.fromEntries(PICKER_SECTIONS.map(sec => [sec.type, (data[ITEM_TYPE_META[sec.type].dataKey] || []).length]));
+  const menuItems = [{
+    key: "all",
+    label: "🔎 Поиск по всем материалам"
+  }, {
+    key: "sep",
+    sep: true
+  }, ...PICKER_SECTIONS.map(sec => ({
+    key: sec.type,
+    label: sec.icon + " " + sec.label,
+    hint: String(counts[sec.type])
+  }))];
+  const buttons = /*#__PURE__*/React.createElement("div", {
     className: "row wrap",
     style: {
       gap: 8,
-      marginTop: 6,
       alignItems: "center"
     }
-  }, /*#__PURE__*/React.createElement("span", {
-    className: "hint"
-  }, "\u041D\u0435 \u043F\u043E\u043A\u0430\u0437\u0430\u043D\u044B (", ctxLabel, "): ", hiddenCount, " \u2014 \u0443\u0436\u0435 \u0438\u0441\u043F\u043E\u043B\u044C\u0437\u043E\u0432\u0430\u043D\u044B \u0432 \u0443\u0440\u043E\u043A\u0430\u0445, \u043E\u0442\u043A\u043B\u044E\u0447\u0435\u043D\u044B \u0432\u0440\u0443\u0447\u043D\u0443\u044E \u0438\u043B\u0438 \u043D\u0430\u0437\u043D\u0430\u0447\u0435\u043D\u044B \u0434\u0440\u0443\u0433\u0438\u043C \u043A\u043B\u0430\u0441\u0441\u0430\u043C."), /*#__PURE__*/React.createElement(Btn, {
-    kind: "ghost",
-    sm: true,
-    onClick: () => setShowHidden(v => !v)
-  }, showHidden ? "Скрыть их" : "Показать их")), /*#__PURE__*/React.createElement("div", {
-    style: {
-      maxHeight: 260,
-      overflow: "auto",
-      marginTop: 8
-    }
-  }, list.length === 0 && /*#__PURE__*/React.createElement("div", {
-    className: "hint"
-  }, "\u041D\u0438\u0447\u0435\u0433\u043E \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D\u043E."), list.slice(0, 30).map(e => {
-    const exerciseItem = type === "exercise" ? findItem(it => it.type === "exercise" && it.refId === e.id) : null;
-    const wholeItem = type !== "exercise" ? findItem(it => it.type === type && it.refId === e.id) : null;
+  }, /*#__PURE__*/React.createElement(PopMenu, {
+    kind: "primary",
+    label: "\uFF0B \u0412\u044B\u0431\u0440\u0430\u0442\u044C \u043C\u0430\u0442\u0435\u0440\u0438\u0430\u043B\u044B",
+    items: menuItems,
+    onPick: choose,
+    selectedKey: type,
+    title: "\u0412\u044B\u0431\u0435\u0440\u0438\u0442\u0435 \u0440\u0430\u0437\u0434\u0435\u043B \u2014 \u043E\u0442\u043A\u0440\u043E\u0435\u0442\u0441\u044F \u0441\u043F\u0438\u0441\u043E\u043A \u043C\u0430\u0442\u0435\u0440\u0438\u0430\u043B\u043E\u0432, \u0438\u043B\u0438 \u043D\u0430\u0439\u0434\u0438\u0442\u0435 \u043D\u0443\u0436\u043D\u043E\u0435 \u043F\u043E\u0438\u0441\u043A\u043E\u043C"
+  }), extra);
+  if (!type) return buttons;
+  const query = q.trim().toLowerCase();
+  const searching = query.length > 0;
+  const sections = type === "all" ? PICKER_SECTIONS.map(sec => sec.type) : [type];
+  let rows = [];
+  let hiddenCount = 0;
+  sections.forEach(t => {
+    (data[ITEM_TYPE_META[t].dataKey] || []).forEach(e => {
+      if (type === "all" && !searching) return;
+      if (t === "exercise" && type !== "all" && exType && e.typeTagId !== exType) return;
+      if (searching && !materialSearchText(data, t, e, tagNames).includes(query)) return;
+      const hr = hiddenReason(t, e);
+      if (hr && !searching && type !== "all") {
+        hiddenCount++;
+        if (!showHidden) return;
+      }
+      rows.push({
+        t,
+        e,
+        hr
+      });
+    });
+  });
+  const total = rows.length;
+  const LIMIT = 40;
+  rows = rows.slice(0, LIMIT);
+  const secLabel = type === "all" ? "Все материалы" : (PICKER_SECTIONS.find(x => x.type === type) || {}).label;
+  const exTypes = (data.tags.exerciseType || []).filter(t => (data.examples || []).some(e => e.typeTagId === t.id));
+  const renderRow = ({
+    t,
+    e,
+    hr
+  }) => {
+    const meta = ITEM_TYPE_META[t];
+    const key = t + ":" + e.id;
+    const exerciseItem = t === "exercise" ? findItem(it => it.type === "exercise" && it.refId === e.id) : null;
+    const wholeItem = t !== "exercise" ? findItem(it => it.type === t && it.refId === e.id) : null;
+    const qs = t !== "exercise" ? e.course?.questions || [] : [];
+    const typeName = t === "exercise" ? ((data.tags.exerciseType || []).find(x => x.id === e.typeTagId) || {}).name : "";
     return /*#__PURE__*/React.createElement("div", {
-      key: e.id
+      key: key
     }, /*#__PURE__*/React.createElement("div", {
       className: "row",
       style: {
         padding: "5px 0",
-        borderBottom: "1px solid var(--line)"
+        borderBottom: "1px solid var(--line)",
+        gap: 6
       }
     }, /*#__PURE__*/React.createElement("div", {
       style: {
         flex: 1,
+        minWidth: 0,
         fontSize: 13,
-        cursor: type === "exercise" ? "default" : "pointer"
+        cursor: t === "exercise" ? "default" : "pointer"
       },
-      onClick: () => type !== "exercise" && setExpandedId(expandedId === e.id ? null : e.id)
-    }, meta.titleOf(data, e), hiddenReason(e) && /*#__PURE__*/React.createElement("span", {
+      onClick: () => t !== "exercise" && setExpandedKey(expandedKey === key ? null : key)
+    }, type === "all" && /*#__PURE__*/React.createElement("span", {
+      className: "chip",
+      style: {
+        marginRight: 6,
+        padding: "1px 7px",
+        fontSize: 11
+      }
+    }, NEW_MATERIAL_LABEL[t]), typeName && /*#__PURE__*/React.createElement("span", {
+      className: "chip",
+      style: {
+        marginRight: 6,
+        padding: "1px 7px",
+        fontSize: 11
+      }
+    }, typeName), meta.titleOf(data, e), hr && /*#__PURE__*/React.createElement("span", {
       className: "hint"
-    }, " \xB7 ", hiddenReasonText(hiddenReason(e), ctxLabel))), type === "exercise" ? /*#__PURE__*/React.createElement(Btn, {
-      kind: "ghost",
+    }, " \xB7 ", hiddenReasonText(hr, ctxLabel)), t !== "exercise" && qs.length > 0 && /*#__PURE__*/React.createElement("span", {
+      className: "hint"
+    }, " \xB7 \u0432\u043E\u043F\u0440\u043E\u0441\u043E\u0432: ", qs.length)), t === "exercise" ? /*#__PURE__*/React.createElement(Btn, {
+      kind: exerciseItem ? "primary" : "ghost",
       sm: true,
       title: exerciseItem ? "Убрать из урока" : "Добавить в урок",
       onClick: () => exerciseItem ? onRemoveItem(exerciseItem.id) : onAddExercise(e.id)
-    }, /*#__PURE__*/React.createElement(Icon, {
-      name: exerciseItem ? "check" : "plus",
+    }, exerciseItem ? "✓ в уроке" : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(Icon, {
+      name: "plus",
       size: 12
-    })) : /*#__PURE__*/React.createElement(Icon, {
+    }), " \u0434\u043E\u0431\u0430\u0432\u0438\u0442\u044C")) : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(Btn, {
+      kind: wholeItem ? "primary" : "ghost",
+      sm: true,
+      title: wholeItem ? "Убрать карточку из урока" : "Добавить карточку целиком (без отдельных вопросов)",
+      onClick: () => wholeItem ? onRemoveItem(wholeItem.id) : onAddWhole(t, e.id)
+    }, wholeItem ? "✓ целиком" : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(Icon, {
+      name: "plus",
+      size: 12
+    }), " \u0446\u0435\u043B\u0438\u043A\u043E\u043C")), /*#__PURE__*/React.createElement("span", {
+      style: {
+        cursor: "pointer",
+        display: "inline-flex",
+        transform: expandedKey === key ? "rotate(90deg)" : undefined
+      },
+      onClick: () => setExpandedKey(expandedKey === key ? null : key),
+      title: "\u0412\u044B\u0431\u0440\u0430\u0442\u044C \u043E\u0442\u0434\u0435\u043B\u044C\u043D\u044B\u0435 \u0432\u043E\u043F\u0440\u043E\u0441\u044B \u043A\u0430\u0440\u0442\u043E\u0447\u043A\u0438"
+    }, /*#__PURE__*/React.createElement(Icon, {
       name: "chev",
       size: 13
-    })), type !== "exercise" && expandedId === e.id && /*#__PURE__*/React.createElement("div", {
+    })))), t !== "exercise" && expandedKey === key && /*#__PURE__*/React.createElement("div", {
       style: {
         padding: "4px 0 8px 10px",
         borderBottom: "1px solid var(--line)"
       }
-    }, (e.course?.questions || []).length === 0 && /*#__PURE__*/React.createElement("div", {
+    }, qs.length === 0 && /*#__PURE__*/React.createElement("div", {
       className: "hint"
-    }, "\u0423 \u044D\u0442\u043E\u0439 \u043A\u0430\u0440\u0442\u043E\u0447\u043A\u0438 \u043F\u043E\u043A\u0430 \u043D\u0435\u0442 \u0432\u043E\u043F\u0440\u043E\u0441\u043E\u0432 \u0432 \xAB\u0425\u043E\u0434\u0435 \u0443\u0440\u043E\u043A\u0430\xBB."), (e.course?.questions || []).length > 0 && (() => {
-      const all = [...(e.course.questions || [])].sort((a, b) => a.order - b.order);
+    }, "\u0423 \u044D\u0442\u043E\u0439 \u043A\u0430\u0440\u0442\u043E\u0447\u043A\u0438 \u043F\u043E\u043A\u0430 \u043D\u0435\u0442 \u0432\u043E\u043F\u0440\u043E\u0441\u043E\u0432 \u0432 \xAB\u0425\u043E\u0434\u0435 \u0443\u0440\u043E\u043A\u0430\xBB."), qs.length > 0 && (() => {
+      const all = [...qs].sort((a, b) => a.order - b.order);
       const picked = all.map(qq => findItem(it => it.type === "question" && it.questionId === qq.id)).filter(Boolean);
       return /*#__PURE__*/React.createElement("div", {
         className: "row wrap",
@@ -6466,7 +6615,7 @@ function ItemPicker({
         kind: "primary",
         sm: true,
         disabled: picked.length === all.length,
-        onClick: () => onAddQuestions(type, e.id, all.map(qq => qq.id))
+        onClick: () => onAddQuestions(t, e.id, all.map(qq => qq.id))
       }, "\u2611 \u0412\u044B\u0431\u0440\u0430\u0442\u044C \u0432\u0441\u0435 (", all.length, ")"), /*#__PURE__*/React.createElement(Btn, {
         kind: "ghost",
         sm: true,
@@ -6475,7 +6624,7 @@ function ItemPicker({
       }, "\u0421\u043D\u044F\u0442\u044C \u0432\u0441\u0435"), /*#__PURE__*/React.createElement("span", {
         className: "hint"
       }, "\u0412\u044B\u0431\u0440\u0430\u043D\u043E: ", picked.length, " \u0438\u0437 ", all.length, " \u2014 \u0438\u043B\u0438 \u043E\u0442\u043C\u0435\u0447\u0430\u0439\u0442\u0435 \u043D\u0443\u0436\u043D\u044B\u0435 \u043A\u043D\u043E\u043F\u043A\u043E\u0439 \u0441\u043F\u0440\u0430\u0432\u0430 \u043E\u0442 \u0432\u043E\u043F\u0440\u043E\u0441\u0430"));
-    })(), [...(e.course?.questions || [])].sort((a, b) => a.order - b.order).map(qq => {
+    })(), [...qs].sort((a, b) => a.order - b.order).map(qq => {
       const qItem = findItem(it => it.type === "question" && it.questionId === qq.id);
       return /*#__PURE__*/React.createElement("div", {
         key: qq.id,
@@ -6492,20 +6641,334 @@ function ItemPicker({
         kind: "ghost",
         sm: true,
         title: qItem ? "Убрать из урока" : "Добавить в урок",
-        onClick: () => qItem ? onRemoveItem(qItem.id) : onAddQuestion(type, e.id, qq.id)
+        onClick: () => qItem ? onRemoveItem(qItem.id) : onAddQuestion(t, e.id, qq.id)
       }, /*#__PURE__*/React.createElement(Icon, {
         name: qItem ? "check" : "plus",
         size: 11
       })));
-    }), /*#__PURE__*/React.createElement(Btn, {
-      kind: wholeItem ? "primary" : "ghost",
-      sm: true,
-      onClick: () => wholeItem ? onRemoveItem(wholeItem.id) : onAddWhole(type, e.id),
-      style: {
-        marginTop: 4
+    })));
+  };
+  return /*#__PURE__*/React.createElement("div", null, buttons, /*#__PURE__*/React.createElement("div", {
+    className: "addbox",
+    style: {
+      flexDirection: "column",
+      alignItems: "stretch",
+      marginTop: 10
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "row wrap",
+    style: {
+      gap: 8,
+      alignItems: "center"
+    }
+  }, /*#__PURE__*/React.createElement(PopMenu, {
+    label: "Раздел: " + secLabel,
+    sm: true,
+    items: menuItems,
+    onPick: choose,
+    selectedKey: type
+  }), /*#__PURE__*/React.createElement("input", {
+    value: q,
+    onChange: e => setQ(e.target.value),
+    autoFocus: true,
+    placeholder: type === "all" ? "Поиск по упражнениям, теории, персоналиям и произведениям…" : "Поиск в разделе «" + secLabel + "»…",
+    style: {
+      flex: 1,
+      minWidth: 180
+    }
+  }), type === "exercise" && exTypes.length > 0 && /*#__PURE__*/React.createElement("select", {
+    className: "toolselect",
+    value: exType,
+    onChange: e => setExType(e.target.value),
+    title: "\u041F\u043E\u043A\u0430\u0437\u0430\u0442\u044C \u0442\u043E\u043B\u044C\u043A\u043E \u0443\u043F\u0440\u0430\u0436\u043D\u0435\u043D\u0438\u044F \u0432\u044B\u0431\u0440\u0430\u043D\u043D\u043E\u0433\u043E \u0432\u0438\u0434\u0430"
+  }, /*#__PURE__*/React.createElement("option", {
+    value: ""
+  }, "\u0412\u0441\u0435 \u0432\u0438\u0434\u044B"), exTypes.map(t => /*#__PURE__*/React.createElement("option", {
+    key: t.id,
+    value: t.id
+  }, t.name))), /*#__PURE__*/React.createElement(Btn, {
+    kind: "ghost",
+    sm: true,
+    onClick: () => setType(null),
+    title: "\u0421\u0432\u0435\u0440\u043D\u0443\u0442\u044C \u0432\u044B\u0431\u043E\u0440"
+  }, /*#__PURE__*/React.createElement(Icon, {
+    name: "close",
+    size: 12
+  }), " \u0421\u0432\u0435\u0440\u043D\u0443\u0442\u044C")), hiddenCount > 0 && /*#__PURE__*/React.createElement("div", {
+    className: "row wrap",
+    style: {
+      gap: 8,
+      marginTop: 6,
+      alignItems: "center"
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    className: "hint"
+  }, "\u041D\u0435 \u043F\u043E\u043A\u0430\u0437\u0430\u043D\u044B (", ctxLabel, "): ", hiddenCount, " \u2014 \u0443\u0436\u0435 \u0438\u0441\u043F\u043E\u043B\u044C\u0437\u043E\u0432\u0430\u043D\u044B \u0432 \u0443\u0440\u043E\u043A\u0430\u0445, \u043E\u0442\u043A\u043B\u044E\u0447\u0435\u043D\u044B \u0432\u0440\u0443\u0447\u043D\u0443\u044E \u0438\u043B\u0438 \u043D\u0430\u0437\u043D\u0430\u0447\u0435\u043D\u044B \u0434\u0440\u0443\u0433\u0438\u043C \u043A\u043B\u0430\u0441\u0441\u0430\u043C. \u041F\u0440\u0438 \u043F\u043E\u0438\u0441\u043A\u0435 \u043E\u043D\u0438 \u043F\u043E\u043A\u0430\u0437\u044B\u0432\u0430\u044E\u0442\u0441\u044F."), /*#__PURE__*/React.createElement(Btn, {
+    kind: "ghost",
+    sm: true,
+    onClick: () => setShowHidden(v => !v)
+  }, showHidden ? "Скрыть их" : "Показать их")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      maxHeight: 320,
+      overflow: "auto",
+      marginTop: 8
+    }
+  }, type === "all" && !searching && /*#__PURE__*/React.createElement("div", {
+    className: "hint"
+  }, "\u0412\u0432\u0435\u0434\u0438\u0442\u0435 \u0441\u043B\u043E\u0432\u043E \u2014 \u043F\u043E\u0438\u0441\u043A \u0438\u0434\u0451\u0442 \u0441\u0440\u0430\u0437\u0443 \u043F\u043E \u0432\u0441\u0435\u043C \u0440\u0430\u0437\u0434\u0435\u043B\u0430\u043C (\u0442\u0435\u043A\u0441\u0442 \u0443\u043F\u0440\u0430\u0436\u043D\u0435\u043D\u0438\u0439, \u043D\u0430\u0437\u0432\u0430\u043D\u0438\u044F, \u0430\u0432\u0442\u043E\u0440\u044B, \u043C\u0435\u0442\u043A\u0438)."), !(type === "all" && !searching) && total === 0 && /*#__PURE__*/React.createElement("div", {
+    className: "hint"
+  }, "\u041D\u0438\u0447\u0435\u0433\u043E \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D\u043E."), rows.map(renderRow), total > LIMIT && /*#__PURE__*/React.createElement("div", {
+    className: "hint",
+    style: {
+      padding: "6px 0"
+    }
+  }, "\u041F\u043E\u043A\u0430\u0437\u0430\u043D\u043E ", LIMIT, " \u0438\u0437 ", total, " \u2014 \u0443\u0442\u043E\u0447\u043D\u0438\u0442\u0435 \u043F\u043E\u0438\u0441\u043A."))));
+}
+
+// Быстрая карточка для персоналии / произведения / истории-теории: название, (вид / автор), классы, текст.
+// Создаётся в своём разделе («Персоналии», «Произведения», «История и теория»), а в урок встаёт целиком.
+function EntityQuickForm({
+  data,
+  update,
+  projectPath,
+  type,
+  editId,
+  onDone
+}) {
+  const meta = ITEM_TYPE_META[type];
+  const key = meta.dataKey;
+  const existing = editId ? (data[key] || []).find(e => e.id === editId) : null;
+  const [title, setTitle] = useState(existing ? existing.title || "" : "");
+  const [kind, setKind] = useState(existing && existing.kind || "theory");
+  const [authorId, setAuthorId] = useState(existing && existing.authorId || "");
+  const [tagIds, setTagIds] = useState(existing && existing.tagIds || []);
+  const [html, setHtml] = useState(existing && existing.course && existing.course.lectureHtml || "");
+  const placeholder = type === "personality" ? "Имя автора" : type === "work" ? "Название произведения" : "Название темы";
+  const save = () => {
+    if (!title.trim()) {
+      showToast("Введите название");
+      return;
+    }
+    let createdId = null;
+    update(d => {
+      const arr = d[key];
+      if (existing) {
+        const i = arr.findIndex(e => e.id === editId);
+        if (i >= 0) arr[i] = {
+          ...arr[i],
+          title: title.trim(),
+          ...(type === "theory" ? {
+            kind
+          } : {}),
+          ...(type === "work" ? {
+            authorId: authorId || null
+          } : {}),
+          tagIds,
+          course: {
+            ...arr[i].course,
+            lectureHtml: html
+          },
+          updatedAt: nowISO()
+        };
+      } else {
+        const e = migrateEntity({
+          title: title.trim(),
+          kind: type === "theory" ? kind : null,
+          authorId: type === "work" ? authorId || null : null,
+          tagIds,
+          course: {
+            lectureHtml: html
+          }
+        }, {});
+        arr.push(e);
+        createdId = e.id;
       }
-    }, wholeItem ? "✓ Карточка целиком добавлена" : "+ Добавить карточку целиком (без вопросов)")));
-  })));
+      return d;
+    });
+    onDone(createdId);
+  };
+  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("input", {
+    className: "titleinput",
+    value: title,
+    placeholder: placeholder,
+    autoFocus: !existing,
+    onChange: e => setTitle(e.target.value)
+  }), /*#__PURE__*/React.createElement("div", {
+    className: "row wrap",
+    style: {
+      margin: "8px 0 12px",
+      gap: 12,
+      alignItems: "center"
+    }
+  }, type === "theory" && /*#__PURE__*/React.createElement("div", {
+    className: "seg"
+  }, (data.tags.historyTheoryKind || []).map(k => /*#__PURE__*/React.createElement("button", {
+    key: k.id,
+    "aria-pressed": kind === k.id ? "true" : undefined,
+    onClick: () => setKind(k.id)
+  }, k.name))), type === "work" && /*#__PURE__*/React.createElement("select", {
+    className: "toolselect",
+    value: authorId,
+    onChange: e => setAuthorId(e.target.value)
+  }, /*#__PURE__*/React.createElement("option", {
+    value: ""
+  }, "\u0410\u0432\u0442\u043E\u0440 \u043D\u0435 \u0443\u043A\u0430\u0437\u0430\u043D"), data.personalities.map(p => /*#__PURE__*/React.createElement("option", {
+    key: p.id,
+    value: p.id
+  }, p.title)))), /*#__PURE__*/React.createElement(Field, {
+    label: TAG_NS_LABELS.classTag.title + " (для каких классов предлагается при составлении уроков; пусто — всем)"
+  }, /*#__PURE__*/React.createElement(TagPicker, {
+    data: data,
+    update: update,
+    ns: "classTag",
+    selectedIds: nsTagIds(tagIds, "classTag", data),
+    onChange: ids => setTagIds(withNsTagIds(tagIds, "classTag", data, ids))
+  })), /*#__PURE__*/React.createElement(Field, {
+    label: "\u0422\u0435\u043A\u0441\u0442 \u043A\u0430\u0440\u0442\u043E\u0447\u043A\u0438"
+  }, /*#__PURE__*/React.createElement(RichEditor, {
+    html: html,
+    onChange: setHtml,
+    projectPath: projectPath,
+    compact: true,
+    update: update,
+    sourceInfo: {
+      section: meta.label,
+      entityId: editId || null,
+      entityTitle: title,
+      authorId: type === "personality" ? editId || null : type === "work" ? authorId || null : null,
+      workId: type === "work" ? editId || null : null,
+      genreTagIds: []
+    }
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "hint"
+  }, "\u041E\u0441\u0442\u0430\u043B\u044C\u043D\u044B\u0435 \u043F\u043E\u043B\u044F (\u0436\u0430\u043D\u0440\u044B, \u0446\u0432\u0435\u0442, \u0434\u043E\u0441\u0442\u0443\u043F\u043D\u043E\u0441\u0442\u044C) \u043C\u043E\u0436\u043D\u043E \u043D\u0430\u0441\u0442\u0440\u043E\u0438\u0442\u044C \u043F\u043E\u0437\u0436\u0435 \u0432 \u0440\u0430\u0437\u0434\u0435\u043B\u0435 \xAB", type === "personality" ? "Персоналии" : type === "work" ? "Произведения" : "История и теория", "\xBB. \u0412\u043E\u043F\u0440\u043E\u0441\u044B \u043A \u043A\u0430\u0440\u0442\u043E\u0447\u043A\u0435 \u2014 \u0442\u0430\u043C \u0436\u0435, \u0432 \xAB\u0425\u043E\u0434\u0435 \u0443\u0440\u043E\u043A\u0430\xBB, \u043B\u0438\u0431\u043E \u043F\u0440\u044F\u043C\u043E \u0432 \u0443\u0440\u043E\u043A\u0435."), /*#__PURE__*/React.createElement("div", {
+    className: "row",
+    style: {
+      justifyContent: "flex-end",
+      marginTop: 10
+    }
+  }, /*#__PURE__*/React.createElement(Btn, {
+    kind: "ghost",
+    onClick: () => onDone(null)
+  }, "\u041E\u0442\u043C\u0435\u043D\u0430"), /*#__PURE__*/React.createElement(Btn, {
+    kind: "primary",
+    onClick: save
+  }, /*#__PURE__*/React.createElement(Icon, {
+    name: "save",
+    size: 13
+  }), " ", existing ? "Сохранить" : "Создать и добавить в урок")));
+}
+
+// Окно «Создать материал в уроке» / «Править материал»: сразу выбирается тип, затем вводится и редактируется текст.
+// spec: { mode: "create" | "edit", type, id? }. Новый материал сохраняется в своём разделе и добавляется в урок.
+function LessonMaterialModal({
+  data,
+  update,
+  projectPath,
+  lesson,
+  spec,
+  onCreated,
+  onClose
+}) {
+  const isEdit = spec.mode === "edit";
+  const type = spec.type;
+  const types = data.tags.exerciseType || [];
+  const existingEx = isEdit && type === "exercise" ? data.examples.find(e => e.id === spec.id) : null;
+  const [typeId, setTypeId] = useState(() => {
+    if (existingEx) return existingEx.typeTagId;
+    const t = types.find(x => x.id !== TROPE_WALK_TYPE_ID) || types[0];
+    return t ? t.id : "";
+  });
+  const pickType = async v => {
+    if (v !== "__new") {
+      setTypeId(v);
+      return;
+    }
+    const name = await PromptStr("Название нового вида упражнения:");
+    if (!name || !name.trim()) return;
+    const old = types.find(t => t.name.toLowerCase() === name.trim().toLowerCase());
+    if (old) {
+      setTypeId(old.id);
+      return;
+    }
+    const id = uid();
+    update(d => {
+      d.tags.exerciseType.push({
+        id,
+        name: name.trim(),
+        color: SWATCHES[Math.floor(Math.random() * SWATCHES.length)],
+        categoryId: null,
+        order: d.tags.exerciseType.length,
+        slots: []
+      });
+      return d;
+    });
+    setTypeId(id);
+  };
+  const done = newId => {
+    if (newId && !isEdit) onCreated(type, newId);
+    onClose();
+  };
+  const where = type === "exercise" ? "в банке упражнений" : "в разделе «" + (type === "personality" ? "Персоналии" : type === "work" ? "Произведения" : "История и теория") + "»";
+  const lessonName = (lesson.topic || "").trim() ? "«" + lesson.topic.trim() + "»" : "этот урок";
+  return /*#__PURE__*/React.createElement("div", {
+    className: "overlay",
+    style: {
+      zIndex: 200
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "modal",
+    style: {
+      maxWidth: 940
+    },
+    onClick: e => e.stopPropagation()
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "modal-head"
+  }, /*#__PURE__*/React.createElement("h3", null, isEdit ? "Править: " : "Новый материал — ", NEW_MATERIAL_LABEL[type]), /*#__PURE__*/React.createElement(Btn, {
+    kind: "ghost",
+    onClick: onClose,
+    title: "\u0417\u0430\u043A\u0440\u044B\u0442\u044C \u0431\u0435\u0437 \u0441\u043E\u0445\u0440\u0430\u043D\u0435\u043D\u0438\u044F"
+  }, /*#__PURE__*/React.createElement(Icon, {
+    name: "close",
+    size: 16
+  }))), /*#__PURE__*/React.createElement("div", {
+    className: "modal-body"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "hint",
+    style: {
+      marginBottom: 10
+    }
+  }, isEdit ? "Изменения сохраняются в самой карточке (" + where + ") и будут видны во всех уроках, где она используется." : "Материал сохранится " + where + " и сразу добавится в " + lessonName + "."), type === "exercise" ? /*#__PURE__*/React.createElement(React.Fragment, null, !isEdit && /*#__PURE__*/React.createElement(Field, {
+    label: "\u0412\u0438\u0434 \u0443\u043F\u0440\u0430\u0436\u043D\u0435\u043D\u0438\u044F"
+  }, /*#__PURE__*/React.createElement("select", {
+    className: "toolselect",
+    value: typeId,
+    onChange: e => pickType(e.target.value)
+  }, !typeId && /*#__PURE__*/React.createElement("option", {
+    value: ""
+  }, "\u2014 \u0432\u044B\u0431\u0435\u0440\u0438\u0442\u0435 \u0432\u0438\u0434 \u2014"), types.map(t => /*#__PURE__*/React.createElement("option", {
+    key: t.id,
+    value: t.id
+  }, t.name)), /*#__PURE__*/React.createElement("option", {
+    value: "__new"
+  }, "\uFF0B \u041D\u043E\u0432\u044B\u0439 \u0432\u0438\u0434\u2026"))), typeId ? /*#__PURE__*/React.createElement(ExampleForm, {
+    key: typeId + (spec.id || ""),
+    data: data,
+    update: update,
+    projectPath: projectPath,
+    typeId: typeId,
+    editId: isEdit ? spec.id : null,
+    onDone: done
+  }) : /*#__PURE__*/React.createElement("div", {
+    className: "hint"
+  }, "\u0412\u044B\u0431\u0435\u0440\u0438\u0442\u0435 \u0432\u0438\u0434 \u0443\u043F\u0440\u0430\u0436\u043D\u0435\u043D\u0438\u044F (\u0438\u043B\u0438 \u0441\u043E\u0437\u0434\u0430\u0439\u0442\u0435 \u043D\u043E\u0432\u044B\u0439), \u0447\u0442\u043E\u0431\u044B \u0432\u0432\u0435\u0441\u0442\u0438 \u0442\u0435\u043A\u0441\u0442.")) : /*#__PURE__*/React.createElement(EntityQuickForm, {
+    data: data,
+    update: update,
+    projectPath: projectPath,
+    type: type,
+    editId: isEdit ? spec.id : null,
+    onDone: done
+  }))));
 }
 
 // Независимая копия существующего урока в выбранный класс/литеру (или курс) — материалы и ДЗ
@@ -7526,7 +7989,8 @@ function EntityMaterialRow({
   onRemoveGroup,
   onMoveQuestion,
   embedded,
-  onPrint
+  onPrint,
+  onEdit
 }) {
   const [open, setOpen] = useState(!!embedded);
   const [full, setFull] = useState(false);
@@ -7883,7 +8347,15 @@ function EntityMaterialRow({
     }
   }, meta.titleOf(data, entity)), questionItemsList.length > 0 && /*#__PURE__*/React.createElement("span", {
     className: "hint"
-  }, questionItemsList.length, " \u0432\u043E\u043F\u0440."), open && fullBtn, onPrint && /*#__PURE__*/React.createElement(Btn, {
+  }, questionItemsList.length, " \u0432\u043E\u043F\u0440."), open && fullBtn, onEdit && /*#__PURE__*/React.createElement(Btn, {
+    kind: "ghost",
+    sm: true,
+    onClick: e => {
+      e.stopPropagation();
+      onEdit();
+    },
+    title: "\u041F\u0440\u0430\u0432\u0438\u0442\u044C \u043D\u0430\u0437\u0432\u0430\u043D\u0438\u0435 \u0438 \u0442\u0435\u043A\u0441\u0442 \u043A\u0430\u0440\u0442\u043E\u0447\u043A\u0438 (\u0438\u0437\u043C\u0435\u043D\u0438\u0442\u0441\u044F \u0432 \u0440\u0430\u0437\u0434\u0435\u043B\u0435 \u043A\u0430\u0440\u0442\u043E\u0447\u0435\u043A)"
+  }, "\u270E"), onPrint && /*#__PURE__*/React.createElement(Btn, {
     kind: "ghost",
     sm: true,
     onClick: e => {
@@ -8664,6 +9136,7 @@ function LessonPage({
   const [printHw, setPrintHw] = useState(false);
   const [copyLettersOpen, setCopyLettersOpen] = useState(false);
   const [copyLettersChecked, setCopyLettersChecked] = useState([]);
+  const [matModal, setMatModal] = useState(null); // { mode: "create" | "edit", type, id? } — окно создания/правки материала
   if (!lesson) return /*#__PURE__*/React.createElement("div", {
     className: "empty"
   }, "\u0423\u0440\u043E\u043A \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D. ", /*#__PURE__*/React.createElement(Btn, {
@@ -8819,68 +9292,6 @@ function LessonPage({
       return d;
     });
     onBack();
-  };
-  const quickCreatePersonality = async () => {
-    const name = await PromptStr("Имя автора:");
-    if (!name || !name.trim()) return;
-    const p = migrateEntity({
-      title: name.trim()
-    }, {});
-    update(d => {
-      d.personalities.push(p);
-      const l = d.lessons.find(x => x.id === lessonId);
-      l.items.push(migrateLessonItem({
-        type: "personality",
-        refId: p.id
-      }));
-      return d;
-    });
-  };
-  const quickCreateWork = async () => {
-    const title = await PromptStr("Название произведения:");
-    if (!title || !title.trim()) return;
-    const w = migrateEntity({
-      title: title.trim()
-    }, {});
-    update(d => {
-      d.works.push(w);
-      const l = d.lessons.find(x => x.id === lessonId);
-      l.items.push(migrateLessonItem({
-        type: "work",
-        refId: w.id
-      }));
-      return d;
-    });
-  };
-  const quickCreateExercise = async () => {
-    const name = await PromptStr("В какой вид упражнения добавить? (название существующего или нового вида)");
-    if (!name || !name.trim()) return;
-    update(d => {
-      let type = d.tags.exerciseType.find(t => t.name.toLowerCase() === name.trim().toLowerCase());
-      if (!type) {
-        type = {
-          id: uid(),
-          name: name.trim(),
-          color: SWATCHES[Math.floor(Math.random() * SWATCHES.length)],
-          categoryId: null,
-          order: d.tags.exerciseType.length,
-          slots: []
-        };
-        d.tags.exerciseType.push(type);
-      }
-      const ex = migrateExample({
-        typeTagId: type.id,
-        text: "<p>Новое упражнение…</p>"
-      });
-      d.examples.push(ex);
-      const l = d.lessons.find(x => x.id === lessonId);
-      l.items.push(migrateLessonItem({
-        type: "exercise",
-        refId: ex.id
-      }));
-      return d;
-    });
-    showToast("Упражнение создано и добавлено в урок — откройте банк упражнений, чтобы дописать текст");
   };
   const duplicateThis = async () => {
     const preview = duplicateLessonInSequence(structuredClone(data), lessonId);
@@ -9185,6 +9596,11 @@ function LessonPage({
           onPrint: () => setPrintTarget({
             type: g.entityType,
             id: g.entityId
+          }),
+          onEdit: () => setMatModal({
+            mode: "edit",
+            type: g.entityType,
+            id: g.entityId
           })
         })));
       }
@@ -9249,7 +9665,16 @@ function LessonPage({
         sm: true,
         onClick: () => exportTropeWalkPptx(obj, data),
         title: "\u0421\u043B\u0430\u0439\u0434 \u2014 PowerPoint"
-      }, "PPTX")), /*#__PURE__*/React.createElement(Btn, {
+      }, "PPTX")), obj && /*#__PURE__*/React.createElement(Btn, {
+        kind: "ghost",
+        sm: true,
+        onClick: () => setMatModal({
+          mode: "edit",
+          type: "exercise",
+          id: it.refId
+        }),
+        title: "\u041F\u0440\u0430\u0432\u0438\u0442\u044C \u0442\u0435\u043A\u0441\u0442 \u0443\u043F\u0440\u0430\u0436\u043D\u0435\u043D\u0438\u044F (\u0438\u0437\u043C\u0435\u043D\u0438\u0442\u0441\u044F \u0432 \u0431\u0430\u043D\u043A\u0435 \u0443\u043F\u0440\u0430\u0436\u043D\u0435\u043D\u0438\u0439)"
+      }, "\u270E"), /*#__PURE__*/React.createElement(Btn, {
         kind: "ghost",
         sm: true,
         onClick: () => setPrintTarget({
@@ -9304,34 +9729,20 @@ function LessonPage({
     onAddQuestion: addQuestionItem,
     onAddQuestions: addQuestionsBulk,
     onRemoveItems: removeItemsBulk,
-    onRemoveItem: removeItem
-  })), /*#__PURE__*/React.createElement("div", {
-    className: "row wrap",
-    style: {
-      marginTop: 10
-    }
-  }, /*#__PURE__*/React.createElement(Btn, {
-    kind: "ghost",
-    sm: true,
-    onClick: quickCreateExercise
-  }, /*#__PURE__*/React.createElement(Icon, {
-    name: "plus",
-    size: 12
-  }), " \u041D\u043E\u0432\u043E\u0435 \u0443\u043F\u0440\u0430\u0436\u043D\u0435\u043D\u0438\u0435"), /*#__PURE__*/React.createElement(Btn, {
-    kind: "ghost",
-    sm: true,
-    onClick: quickCreatePersonality
-  }, /*#__PURE__*/React.createElement(Icon, {
-    name: "plus",
-    size: 12
-  }), " \u041D\u043E\u0432\u0430\u044F \u043F\u0435\u0440\u0441\u043E\u043D\u0430\u043B\u0438\u044F"), /*#__PURE__*/React.createElement(Btn, {
-    kind: "ghost",
-    sm: true,
-    onClick: quickCreateWork
-  }, /*#__PURE__*/React.createElement(Icon, {
-    name: "plus",
-    size: 12
-  }), " \u041D\u043E\u0432\u043E\u0435 \u043F\u0440\u043E\u0438\u0437\u0432\u0435\u0434\u0435\u043D\u0438\u0435")))), /*#__PURE__*/React.createElement(Field, {
+    onRemoveItem: removeItem,
+    extra: /*#__PURE__*/React.createElement(PopMenu, {
+      label: "\u270E \u0421\u043E\u0437\u0434\u0430\u0442\u044C \u043C\u0430\u0442\u0435\u0440\u0438\u0430\u043B",
+      title: "\u0421\u043E\u0437\u0434\u0430\u0442\u044C \u043D\u043E\u0432\u044B\u0439 \u043C\u0430\u0442\u0435\u0440\u0438\u0430\u043B \u043F\u0440\u044F\u043C\u043E \u0432 \u0443\u0440\u043E\u043A\u0435: \u043E\u043D \u0441\u043E\u0445\u0440\u0430\u043D\u0438\u0442\u0441\u044F \u0432 \u043D\u0443\u0436\u043D\u043E\u043C \u0440\u0430\u0437\u0434\u0435\u043B\u0435 \u0438 \u0432\u0441\u0442\u0430\u043D\u0435\u0442 \u0432 \u0443\u0440\u043E\u043A",
+      items: PICKER_SECTIONS.map(sec => ({
+        key: sec.type,
+        label: sec.icon + " " + NEW_MATERIAL_LABEL[sec.type]
+      })),
+      onPick: t => setMatModal({
+        mode: "create",
+        type: t
+      })
+    })
+  })))), /*#__PURE__*/React.createElement(Field, {
     label: "\u0414\u043E\u043C\u0430\u0448\u043D\u0435\u0435 \u0437\u0430\u0434\u0430\u043D\u0438\u0435"
   }, /*#__PURE__*/React.createElement(RichEditor, {
     html: lesson.homework,
@@ -9385,6 +9796,14 @@ function LessonPage({
     type: peek.type,
     refId: peek.refId,
     onClose: () => setPeek(null)
+  }), matModal && /*#__PURE__*/React.createElement(LessonMaterialModal, {
+    data: data,
+    update: update,
+    projectPath: projectPath,
+    lesson: lesson,
+    spec: matModal,
+    onCreated: (t, id) => t === "exercise" ? addExerciseItem(id) : addWholeItem(t, id),
+    onClose: () => setMatModal(null)
   }), printHw && /*#__PURE__*/React.createElement(PrintHomeworkModal, {
     lesson: lesson,
     onClose: () => setPrintHw(false)
@@ -11888,6 +12307,450 @@ function lessonPlaceLabel(l, data) {
 }
 
 /* ============================================================
+   «Вечерний набор»: очередь «класс → дата» с автонабором оценок в школьный электронный журнал («Моя школа»).
+   Программа нажимает клавиши в окне браузера, которое в фокусе: оценка → стрелка вниз → оценка → … (Windows).
+   На каждом шаге вы сами открываете нужный журнал, встаёте в клетку первого ученика и нажимаете Enter (или F8);
+   программа читает экран и сверяет предмет/класс/фамилии; только потом набирает. Esc — остановить.
+   ============================================================ */
+function buildEntryGroups(data) {
+  const map = new Map();
+  data.calendar.students.forEach(st => {
+    const key = st.courseId ? "course:" + st.courseId : "class:" + st.class + ":" + (st.classLetterId || "");
+    if (!map.has(key)) map.set(key, {
+      key,
+      courseId: st.courseId || null,
+      grade: st.class || null,
+      letterId: st.classLetterId || null,
+      list: []
+    });
+    map.get(key).list.push(st);
+  });
+  const out = [];
+  map.forEach(g => {
+    const students = [...g.list].sort((a, b) => (a.name || "").localeCompare(b.name || "", "ru"));
+    const ids = new Set(students.map(x => x.id));
+    const marks = data.calendar.marks.filter(m => ids.has(m.studentId) && m.date && (m.scale || "5") === "5" && !m.posted);
+    const dates = Array.from(new Set(marks.map(m => m.date))).sort();
+    if (!dates.length) return;
+    const letter = g.letterId ? classLetterName(data, g.letterId) : "";
+    const label = g.courseId ? (data.courses.find(c => c.id === g.courseId) || {}).name || "Курс" : g.grade + letter + " класс";
+    out.push({
+      key: g.key,
+      label,
+      classLabel: g.courseId ? "" : letter ? g.grade + letter : "",
+      isCourse: !!g.courseId,
+      grade: g.grade,
+      courseId: g.courseId,
+      students,
+      marks,
+      dates
+    });
+  });
+  return out.sort((a, b) => a.label.localeCompare(b.label, "ru", {
+    numeric: true
+  }));
+}
+// отметка → клавиши: «Н» вставляется из буфера обмена, цифры набираются; всё остальное пропускается
+function entryTokenOf(value) {
+  const v = String(value == null ? "" : value).trim();
+  if (v === "Н") return "N";
+  return /^[0-9]{1,3}$/.test(v) ? v : "";
+}
+function EntryQueueModal({
+  data,
+  update,
+  onClose,
+  focus
+}) {
+  const groups = buildEntryGroups(data);
+  const recentFrom = (() => {
+    const x = new Date();
+    x.setDate(x.getDate() - 14);
+    return isoOfDate(x);
+  })(); // по умолчанию отмечены даты за последние 14 дней — старые чаще всего уже внесены, их отмечайте сами
+  const inFocus = g => !focus || (focus.kind === "course" ? g.courseId === focus.value : !g.isCourse && String(g.grade) === String(focus.value));
+  const [sel, setSel] = useState(() => Object.fromEntries(groups.map(g => [g.key, {
+    on: inFocus(g),
+    subject: g.isCourse ? "" : "Литература",
+    checkClass: false,
+    classLabel: g.classLabel,
+    dates: Object.fromEntries(g.dates.map(d => [d, d >= recentFrom]))
+  }])));
+  const [trigger, setTrigger] = useState("Enter");
+  const [verify, setVerify] = useState(true);
+  const [stepMs, setStepMs] = useState(200);
+  const [running, setRunning] = useState(false);
+  const [prog, setProg] = useState(null);
+  const [typedIds, setTypedIds] = useState([]);
+  const [msg, setMsg] = useState("");
+  const [ocrInfo, setOcrInfo] = useState(null);
+  const stepsRef = useRef([]);
+  const inp = {
+    padding: "4px 8px",
+    border: "1.5px solid var(--line)",
+    borderRadius: 8,
+    background: "var(--surface)"
+  };
+  useEffect(() => {
+    if (!window.litAPI.onAutoTypeProgress) return undefined;
+    return window.litAPI.onAutoTypeProgress(pr => {
+      setProg(pr);
+      if (pr.phase === "typed") setTypedIds(p => [...p, pr.id]);
+    });
+  }, []);
+  const buildSteps = () => {
+    const steps = [];
+    groups.forEach(g => {
+      const st = sel[g.key];
+      if (!st || !st.on) return;
+      g.dates.forEach(d => {
+        if (!st.dates[d]) return;
+        const rows = g.students.map(s => {
+          const ms = g.marks.filter(m => m.studentId === s.id && m.date === d);
+          return {
+            s,
+            ms,
+            token: ms.length ? entryTokenOf(ms[0].value) : ""
+          };
+        });
+        steps.push({
+          id: g.key + "|" + d,
+          title: g.label + " · " + formatDateRu(d).slice(0, 5),
+          subject: st.subject.trim(),
+          classLabel: st.checkClass ? st.classLabel.trim() : "",
+          names: g.students.slice(0, 2).map(x => x.name),
+          tokens: rows.map(r => r.token),
+          firstName: g.students[0] ? g.students[0].name : "",
+          markIds: rows.flatMap(r => r.ms.map(m => m.id)),
+          multi: rows.filter(r => r.ms.length > 1).length
+        });
+      });
+    });
+    return steps;
+  };
+  const steps = buildSteps();
+  const totalMarks = steps.reduce((n, x) => n + x.tokens.filter(Boolean).length, 0);
+  const start = async () => {
+    if (!steps.length) return;
+    stepsRef.current = steps;
+    setTypedIds([]);
+    setMsg("");
+    setProg(null);
+    setRunning(true);
+    try {
+      const res = await window.litAPI.autoTypeQueue({
+        steps: steps.map(({
+          id,
+          title,
+          subject,
+          classLabel,
+          names,
+          tokens
+        }) => ({
+          id,
+          title,
+          subject,
+          classLabel,
+          names,
+          tokens
+        })),
+        trigger,
+        verify,
+        stepMs
+      });
+      if (res.ok) setMsg("Очередь выполнена. Проверьте журналы и отметьте «✓ Внесено» для шагов, где нажали «Сохранить».");else if (res.aborted) setMsg(res.error || "Очередь остановлена.");else setMsg("Не получилось: " + (res.error || "неизвестная ошибка"));
+    } catch (e) {
+      setMsg("Не получилось: " + (e && e.message || e));
+    }
+    setRunning(false);
+  };
+  const markPosted = ids => update(d => {
+    const set = new Set(ids);
+    d.calendar.marks.forEach(m => {
+      if (set.has(m.id)) m.posted = true;
+    });
+    return d;
+  });
+  const ocrTest = async () => {
+    setOcrInfo({
+      busy: true
+    });
+    const r = await window.litAPI.autoTypeOcrTest(6000);
+    setOcrInfo(r.ok ? {
+      lang: r.lang,
+      lines: (r.lines || []).slice(0, 25)
+    } : {
+      error: r.error || "не удалось"
+    });
+  };
+  const curStep = prog && prog.index != null ? stepsRef.current[prog.index] : null;
+  const doneSteps = stepsRef.current.filter(x => typedIds.includes(x.id));
+  const phaseText = () => {
+    if (!prog) return "";
+    const k = prog.trigger || trigger;
+    if (prog.phase === "waiting" && curStep) return "Шаг " + (prog.index + 1) + " из " + prog.total + ": «" + curStep.title + "». Откройте в журнале нужный класс и предмет" + (curStep.subject ? " («" + curStep.subject + "»)" : "") + ", щёлкните в клетку первого ученика (" + curStep.firstName + ") в столбце этой даты и нажмите " + k + ". Esc — остановить.";
+    if (prog.phase === "checking") return "Сверяю экран…";
+    if (prog.phase === "typing") return "Набираю… не трогайте мышь и клавиатуру. Esc — остановить.";
+    return "";
+  };
+  const upd = (key, patch) => setSel(p => ({
+    ...p,
+    [key]: {
+      ...p[key],
+      ...patch
+    }
+  }));
+  return /*#__PURE__*/React.createElement("div", {
+    className: "overlay",
+    style: {
+      zIndex: 1260
+    },
+    onClick: e => e.target === e.currentTarget && !running && onClose()
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "modal",
+    style: {
+      maxWidth: 820
+    },
+    onClick: e => e.stopPropagation()
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "modal-head"
+  }, /*#__PURE__*/React.createElement("h3", null, "\u2328 \u0410\u0432\u0442\u043E\u043D\u0430\u0431\u043E\u0440 \u043E\u0446\u0435\u043D\u043E\u043A \u0432 \u0436\u0443\u0440\u043D\u0430\u043B \xAB\u041C\u043E\u044F \u0448\u043A\u043E\u043B\u0430\xBB (\u043E\u0447\u0435\u0440\u0435\u0434\u044C)"), /*#__PURE__*/React.createElement(Btn, {
+    kind: "ghost",
+    sm: true,
+    disabled: running,
+    onClick: onClose
+  }, "\u0417\u0430\u043A\u0440\u044B\u0442\u044C")), /*#__PURE__*/React.createElement("div", {
+    className: "modal-body",
+    style: {
+      display: "grid",
+      gap: 12
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "hint",
+    style: {
+      fontSize: 12.5,
+      lineHeight: 1.55
+    }
+  }, "\u041E\u0447\u0435\u0440\u0435\u0434\u044C \xAB\u043A\u043B\u0430\u0441\u0441 \u2192 \u0434\u0430\u0442\u0430\xBB. \u041D\u0430 \u043A\u0430\u0436\u0434\u043E\u043C \u0448\u0430\u0433\u0435 \u0432\u044B \u0441\u0430\u043C\u0438 \u043E\u0442\u043A\u0440\u044B\u0432\u0430\u0435\u0442\u0435 \u0432 \u0431\u0440\u0430\u0443\u0437\u0435\u0440\u0435 \u0436\u0443\u0440\u043D\u0430\u043B \u043D\u0443\u0436\u043D\u043E\u0433\u043E \u043A\u043B\u0430\u0441\u0441\u0430 \u0438 \u043F\u0440\u0435\u0434\u043C\u0435\u0442\u0430 \u0438 \u0432\u0441\u0442\u0430\u0451\u0442\u0435 (\u0449\u0435\u043B\u0447\u043A\u043E\u043C \u043C\u044B\u0448\u0438) \u0432 \u043A\u043B\u0435\u0442\u043A\u0443 \u043F\u0435\u0440\u0432\u043E\u0433\u043E \u0443\u0447\u0435\u043D\u0438\u043A\u0430 \u0432 \u0441\u0442\u043E\u043B\u0431\u0446\u0435 \u0434\u0430\u0442\u044B, \u0437\u0430\u0442\u0435\u043C \u043D\u0430\u0436\u0438\u043C\u0430\u0435\u0442\u0435 ", /*#__PURE__*/React.createElement("b", null, trigger), ". \u041F\u0440\u043E\u0433\u0440\u0430\u043C\u043C\u0430 \u0447\u0438\u0442\u0430\u0435\u0442 \u044D\u043A\u0440\u0430\u043D \u0438 \u0441\u0432\u0435\u0440\u044F\u0435\u0442 \u043F\u0440\u0435\u0434\u043C\u0435\u0442, \u043A\u043B\u0430\u0441\u0441 \u0438 \u0444\u0430\u043C\u0438\u043B\u0438\u0438 \u043F\u0435\u0440\u0432\u044B\u0445 \u0443\u0447\u0435\u043D\u0438\u043A\u043E\u0432; \u0435\u0441\u043B\u0438 \u0432\u0441\u0451 \u0441\u043E\u0432\u043F\u0430\u043B\u043E \u2014 \u043D\u0430\u0431\u0438\u0440\u0430\u0435\u0442 \u043E\u0446\u0435\u043D\u043A\u0438 \u0441\u0442\u043E\u043B\u0431\u0446\u043E\u043C (\u043E\u0446\u0435\u043D\u043A\u0430 \u2192 \u0441\u0442\u0440\u0435\u043B\u043A\u0430 \u0432\u043D\u0438\u0437 \u2192 \u2026). \u041F\u043E\u0442\u043E\u043C \u0432\u044B \u043F\u0440\u043E\u0432\u0435\u0440\u044F\u0435\u0442\u0435 \u0441\u0442\u043E\u043B\u0431\u0435\u0446 \u0438 \u0441\u0430\u043C\u0438 \u043D\u0430\u0436\u0438\u043C\u0430\u0435\u0442\u0435 \u0432 \u0436\u0443\u0440\u043D\u0430\u043B\u0435 \xAB\u0421\u043E\u0445\u0440\u0430\u043D\u0438\u0442\u044C\xBB. ", /*#__PURE__*/React.createElement("b", null, "Esc \u2014 \u043E\u0441\u0442\u0430\u043D\u043E\u0432\u0438\u0442\u044C."), " \u0423\u0447\u0435\u043D\u0438\u043A\u0438 \u0438\u0434\u0443\u0442 \u043F\u043E \u0430\u043B\u0444\u0430\u0432\u0438\u0442\u0443 \u2014 \u043A\u0430\u043A \u0432 \u0436\u0443\u0440\u043D\u0430\u043B\u0435. \u0414\u0430\u0442\u044B \u0441\u0442\u0430\u0440\u0448\u0435 14 \u0434\u043D\u0435\u0439 \u043F\u043E \u0443\u043C\u043E\u043B\u0447\u0430\u043D\u0438\u044E \u043D\u0435 \u043E\u0442\u043C\u0435\u0447\u0435\u043D\u044B \u2014 \u043E\u0442\u043C\u0435\u0442\u044C\u0442\u0435 \u0441\u0430\u043C\u0438, \u0435\u0441\u043B\u0438 \u043E\u043D\u0438 \u043F\u0440\u0430\u0432\u0434\u0430 \u0435\u0449\u0451 \u043D\u0435 \u0432\u043D\u0435\u0441\u0435\u043D\u044B."), !running && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    className: "row wrap",
+    style: {
+      gap: 8,
+      alignItems: "center",
+      fontSize: 12.5
+    }
+  }, "\u041D\u0430\u0447\u0438\u043D\u0430\u0442\u044C \u043F\u043E \u043A\u043B\u0430\u0432\u0438\u0448\u0435:", /*#__PURE__*/React.createElement(Btn, {
+    kind: trigger === "Enter" ? "primary" : "ghost",
+    sm: true,
+    onClick: () => setTrigger("Enter")
+  }, "Enter"), /*#__PURE__*/React.createElement(Btn, {
+    kind: trigger === "F8" ? "primary" : "ghost",
+    sm: true,
+    onClick: () => setTrigger("F8")
+  }, "F8"), /*#__PURE__*/React.createElement(ToggleSwitch, {
+    checked: verify,
+    onChange: setVerify,
+    label: "\u0421\u0432\u0435\u0440\u044F\u0442\u044C \u0436\u0443\u0440\u043D\u0430\u043B \u043F\u043E \u044D\u043A\u0440\u0430\u043D\u0443",
+    small: true
+  }), "\u0421\u043A\u043E\u0440\u043E\u0441\u0442\u044C:", /*#__PURE__*/React.createElement("select", {
+    value: stepMs,
+    onChange: e => setStepMs(+e.target.value),
+    style: inp
+  }, /*#__PURE__*/React.createElement("option", {
+    value: 120
+  }, "\u0431\u044B\u0441\u0442\u0440\u043E"), /*#__PURE__*/React.createElement("option", {
+    value: 200
+  }, "\u043E\u0431\u044B\u0447\u043D\u043E"), /*#__PURE__*/React.createElement("option", {
+    value: 400
+  }, "\u043C\u0435\u0434\u043B\u0435\u043D\u043D\u043E")), /*#__PURE__*/React.createElement(Btn, {
+    kind: "ghost",
+    sm: true,
+    onClick: ocrTest,
+    title: "\u0427\u0435\u0440\u0435\u0437 6 \u0441\u0435\u043A\u0443\u043D\u0434 \u043F\u0440\u043E\u0447\u0438\u0442\u0430\u0435\u0442 \u043E\u043A\u043D\u043E, \u043A\u043E\u0442\u043E\u0440\u043E\u0435 \u0432 \u0444\u043E\u043A\u0443\u0441\u0435 (\u043E\u0442\u043A\u0440\u043E\u0439\u0442\u0435 \u0436\u0443\u0440\u043D\u0430\u043B) \u2014 \u043F\u043E\u043A\u0430\u0436\u0435\u0442, \u0447\u0442\u043E \u0432\u0438\u0434\u0438\u0442 \u043F\u0440\u043E\u0433\u0440\u0430\u043C\u043C\u0430"
+  }, "\uD83D\uDD0E \u0422\u0435\u0441\u0442 \u0440\u0430\u0441\u043F\u043E\u0437\u043D\u0430\u0432\u0430\u043D\u0438\u044F (6 \u0441)")), trigger === "Enter" && /*#__PURE__*/React.createElement("div", {
+    className: "hint"
+  }, "Enter \u043F\u0440\u0438 \u044D\u0442\u043E\u043C \u043F\u043E\u043F\u0430\u0434\u0430\u0435\u0442 \u0438 \u0432 \u0436\u0443\u0440\u043D\u0430\u043B; \u043F\u0440\u043E\u0433\u0440\u0430\u043C\u043C\u0430 \u0441\u0430\u043C\u0430 \u043A\u043E\u0440\u0440\u0435\u043A\u0442\u0438\u0440\u0443\u0435\u0442 \u043F\u043E\u043B\u043E\u0436\u0435\u043D\u0438\u0435 (\u043E\u0434\u0438\u043D \u0440\u0430\u0437 \u0441\u0442\u0440\u0435\u043B\u043A\u0430 \u0432\u0432\u0435\u0440\u0445). \u0415\u0441\u043B\u0438 \u0441 Enter \u0447\u0442\u043E-\u0442\u043E \u0432\u0435\u0434\u0451\u0442 \u0441\u0435\u0431\u044F \u0441\u0442\u0440\u0430\u043D\u043D\u043E \u2014 \u0432\u044B\u0431\u0435\u0440\u0438\u0442\u0435 F8."), ocrInfo && /*#__PURE__*/React.createElement("div", {
+    className: "qrow",
+    style: {
+      cursor: "default",
+      fontSize: 12
+    }
+  }, ocrInfo.busy ? "Через 6 секунд читаю окно в фокусе — переключитесь на журнал…" : ocrInfo.error ? "Распознавание недоступно: " + ocrInfo.error : "Распознано (" + ocrInfo.lang + "): " + ocrInfo.lines.join(" | ")), groups.length === 0 && /*#__PURE__*/React.createElement("div", {
+    className: "qrow",
+    style: {
+      cursor: "default",
+      color: "#2e8b57"
+    }
+  }, "\u2713 \u041D\u0435\u0432\u043D\u0435\u0441\u0451\u043D\u043D\u044B\u0445 \u043E\u0442\u043C\u0435\u0442\u043E\u043A (5-\u0431\u0430\u043B\u043B\u044C\u043D\u044B\u0445) \u043D\u0435\u0442."), groups.map(g => {
+    const st = sel[g.key];
+    if (!st) return null;
+    return /*#__PURE__*/React.createElement("div", {
+      key: g.key,
+      className: "qrow",
+      style: {
+        cursor: "default",
+        display: "grid",
+        gap: 6,
+        opacity: st.on ? 1 : 0.55
+      }
+    }, /*#__PURE__*/React.createElement("label", {
+      style: {
+        display: "flex",
+        gap: 8,
+        alignItems: "center",
+        fontWeight: 800,
+        cursor: "pointer"
+      }
+    }, /*#__PURE__*/React.createElement("input", {
+      type: "checkbox",
+      checked: st.on,
+      onChange: e => upd(g.key, {
+        on: e.target.checked
+      })
+    }), g.label, " ", /*#__PURE__*/React.createElement("span", {
+      className: "hint"
+    }, "\xB7 \u0434\u0430\u0442: ", g.dates.length, ", \u0443\u0447\u0435\u043D\u0438\u043A\u043E\u0432: ", g.students.length)), st.on && /*#__PURE__*/React.createElement("div", {
+      style: {
+        marginLeft: 26,
+        display: "grid",
+        gap: 6
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "row wrap",
+      style: {
+        gap: 8,
+        alignItems: "center",
+        fontSize: 12.5
+      }
+    }, "\u041F\u0440\u0435\u0434\u043C\u0435\u0442 \u043D\u0430 \u044D\u043A\u0440\u0430\u043D\u0435:", /*#__PURE__*/React.createElement("input", {
+      style: {
+        ...inp,
+        maxWidth: 190
+      },
+      value: st.subject,
+      placeholder: "\u043D\u0435 \u043F\u0440\u043E\u0432\u0435\u0440\u044F\u0442\u044C",
+      onChange: e => upd(g.key, {
+        subject: e.target.value
+      })
+    }), g.classLabel && /*#__PURE__*/React.createElement("label", {
+      style: {
+        display: "flex",
+        gap: 5,
+        alignItems: "center",
+        cursor: "pointer"
+      }
+    }, /*#__PURE__*/React.createElement("input", {
+      type: "checkbox",
+      checked: st.checkClass,
+      onChange: e => upd(g.key, {
+        checkClass: e.target.checked
+      })
+    }), "\u043F\u0440\u043E\u0432\u0435\u0440\u044F\u0442\u044C \u043A\u043B\u0430\u0441\u0441 \xAB", g.classLabel, "\xBB \u043D\u0430 \u044D\u043A\u0440\u0430\u043D\u0435")), /*#__PURE__*/React.createElement("div", {
+      className: "row wrap",
+      style: {
+        gap: 10,
+        fontSize: 12.5
+      }
+    }, g.dates.map(d => /*#__PURE__*/React.createElement("label", {
+      key: d,
+      style: {
+        display: "flex",
+        gap: 4,
+        alignItems: "center",
+        cursor: "pointer"
+      }
+    }, /*#__PURE__*/React.createElement("input", {
+      type: "checkbox",
+      checked: !!st.dates[d],
+      onChange: e => upd(g.key, {
+        dates: {
+          ...st.dates,
+          [d]: e.target.checked
+        }
+      })
+    }), formatDateRu(d).slice(0, 5), " (", g.marks.filter(m => m.date === d).length, ")")))));
+  }), /*#__PURE__*/React.createElement("div", {
+    className: "row wrap",
+    style: {
+      gap: 10,
+      alignItems: "center"
+    }
+  }, /*#__PURE__*/React.createElement(Btn, {
+    kind: "primary",
+    disabled: !steps.length || !totalMarks,
+    onClick: start
+  }, "\u25B6 \u0417\u0430\u043F\u0443\u0441\u0442\u0438\u0442\u044C \u043E\u0447\u0435\u0440\u0435\u0434\u044C (", steps.length, " \u0448\u0430\u0433\u043E\u0432, ", totalMarks, " \u043E\u0442\u043C\u0435\u0442\u043E\u043A)"), steps.some(x => x.multi) && /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 12,
+      color: "var(--neg)"
+    }
+  }, "\u0413\u0434\u0435 \u0443 \u0443\u0447\u0435\u043D\u0438\u043A\u0430 \u043D\u0430 \u0434\u0430\u0442\u0443 \u0431\u043E\u043B\u044C\u0448\u0435 \u043E\u0434\u043D\u043E\u0439 \u043E\u0442\u043C\u0435\u0442\u043A\u0438, \u043D\u0430\u0431\u0438\u0440\u0430\u0435\u0442\u0441\u044F \u043F\u0435\u0440\u0432\u0430\u044F \u2014 \u043E\u0441\u0442\u0430\u043B\u044C\u043D\u044B\u0435 \u0432\u043D\u0435\u0441\u0438\u0442\u0435 \u0432\u0440\u0443\u0447\u043D\u0443\u044E."))), (running || prog) && /*#__PURE__*/React.createElement("div", {
+    className: "qrow",
+    style: {
+      cursor: "default",
+      display: "grid",
+      gap: 8,
+      background: running ? "#fffaf0" : undefined
+    }
+  }, running && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 14,
+      lineHeight: 1.55
+    }
+  }, phaseText()), prog && prog.phase === "mismatch" && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 13,
+      color: "var(--neg)",
+      lineHeight: 1.5
+    }
+  }, "\u26A0 \u0416\u0443\u0440\u043D\u0430\u043B \u043D\u0435 \u0441\u043E\u0432\u043F\u0430\u043B \u0441 \u0448\u0430\u0433\u043E\u043C \xAB", curStep ? curStep.title : "", "\xBB. \u041D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D\u043E \u043D\u0430 \u044D\u043A\u0440\u0430\u043D\u0435: ", /*#__PURE__*/React.createElement("b", null, (prog.failed || []).join(", ")), ".", /*#__PURE__*/React.createElement("br", null), "\u041E\u0442\u043A\u0440\u043E\u0439\u0442\u0435 \u043F\u0440\u0430\u0432\u0438\u043B\u044C\u043D\u044B\u0439 \u0436\u0443\u0440\u043D\u0430\u043B \u0438 \u043D\u0430\u0436\u043C\u0438\u0442\u0435 ", prog.trigger || trigger, " \u0435\u0449\u0451 \u0440\u0430\u0437; ", /*#__PURE__*/React.createElement("b", null, "F9"), " \u2014 \u043D\u0430\u0431\u0440\u0430\u0442\u044C \u0432\u0441\u0451 \u0440\u0430\u0432\u043D\u043E; Esc \u2014 \u043E\u0441\u0442\u0430\u043D\u043E\u0432\u0438\u0442\u044C.", prog.seen && prog.seen.length > 0 && /*#__PURE__*/React.createElement("div", {
+    className: "hint",
+    style: {
+      marginTop: 4
+    }
+  }, "\u041F\u0440\u043E\u0433\u0440\u0430\u043C\u043C\u0430 \u0432\u0438\u0434\u0438\u0442: ", prog.seen.join(" | "))), running && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement(Btn, {
+    kind: "danger",
+    sm: true,
+    onClick: () => window.litAPI.autoTypeCancel()
+  }, "\u25A0 \u041E\u0441\u0442\u0430\u043D\u043E\u0432\u0438\u0442\u044C")), msg && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 13,
+      color: msg.startsWith("Не получилось") ? "var(--neg)" : "#2e8b57"
+    }
+  }, msg), doneSteps.length > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gap: 4
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 700,
+      fontSize: 13
+    }
+  }, "\u041D\u0430\u0431\u0440\u0430\u043D\u043E \u0448\u0430\u0433\u043E\u0432: ", doneSteps.length), doneSteps.map(x => /*#__PURE__*/React.createElement("div", {
+    key: x.id,
+    className: "row",
+    style: {
+      gap: 8,
+      alignItems: "center",
+      fontSize: 12.5
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      flex: 1
+    }
+  }, "\u2713 ", x.title), /*#__PURE__*/React.createElement(Btn, {
+    kind: "ghost",
+    sm: true,
+    onClick: () => markPosted(x.markIds),
+    title: "\u041D\u0430\u0436\u043C\u0438\u0442\u0435 \u043F\u043E\u0441\u043B\u0435 \xAB\u0421\u043E\u0445\u0440\u0430\u043D\u0438\u0442\u044C\xBB \u0432 \u0436\u0443\u0440\u043D\u0430\u043B\u0435 \u2014 \u043E\u0442\u043C\u0435\u0442\u043A\u0438 \u043F\u043E\u043B\u0443\u0447\u0430\u0442 \u043F\u043E\u043C\u0435\u0442\u043A\u0443 \xAB\u0432\u044B\u0441\u0442\u0430\u0432\u043B\u0435\u043D\u0430\xBB"
+  }, "\u2713 \u0412\u043D\u0435\u0441\u0435\u043D\u043E"))), doneSteps.length > 1 && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement(Btn, {
+    kind: "ghost",
+    sm: true,
+    onClick: () => markPosted(doneSteps.flatMap(x => x.markIds))
+  }, "\u2713 \u041E\u0442\u043C\u0435\u0442\u0438\u0442\u044C \u0432\u043D\u0435\u0441\u0451\u043D\u043D\u044B\u043C\u0438 \u0432\u0441\u0435 \u043D\u0430\u0431\u0440\u0430\u043D\u043D\u044B\u0435")))))));
+}
+
+/* ============================================================
    СЕГОДНЯ: уроки дня, кого вызвать, что не выставлено в эл. журнал
    ============================================================ */
 function TodayTab({
@@ -11899,6 +12762,8 @@ function TodayTab({
 }) {
   const today = todayIso();
   const [touched, setTouched] = useState([]); // отметки, переключённые на этой странице, остаются в списке (серыми), пока вы не уйдёте
+  const [queueOpen, setQueueOpen] = useState(false);
+  const canQueue = !!(window.litAPI && window.litAPI.autoTypeQueue);
   const setPostedMarks = (ids, on) => {
     setTouched(p => Array.from(new Set([...p, ...ids])));
     update(d => {
@@ -12125,7 +12990,20 @@ function TodayTab({
     kind: "ghost",
     sm: true,
     onClick: () => onOpenLesson(l)
-  }, "\u041E\u0442\u043A\u0440\u044B\u0442\u044C")))), /*#__PURE__*/React.createElement(H, null, "\u041D\u0435 \u0432\u044B\u0441\u0442\u0430\u0432\u043B\u0435\u043D\u043E \u0432 \u044D\u043B\u0435\u043A\u0442\u0440\u043E\u043D\u043D\u044B\u0439 \u0436\u0443\u0440\u043D\u0430\u043B (\u0437\u0430 14 \u0434\u043D\u0435\u0439)"), groupList.length === 0 ? /*#__PURE__*/React.createElement("div", {
+  }, "\u041E\u0442\u043A\u0440\u044B\u0442\u044C")))), /*#__PURE__*/React.createElement(H, null, "\u041D\u0435 \u0432\u044B\u0441\u0442\u0430\u0432\u043B\u0435\u043D\u043E \u0432 \u044D\u043B\u0435\u043A\u0442\u0440\u043E\u043D\u043D\u044B\u0439 \u0436\u0443\u0440\u043D\u0430\u043B (\u0437\u0430 14 \u0434\u043D\u0435\u0439)"), canQueue && groupList.length > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginBottom: 8
+    }
+  }, /*#__PURE__*/React.createElement(Btn, {
+    kind: "ghost",
+    sm: true,
+    onClick: () => setQueueOpen(true),
+    title: "\u041E\u0447\u0435\u0440\u0435\u0434\u044C \u043F\u043E \u043D\u0435\u0441\u043A\u043E\u043B\u044C\u043A\u0438\u043C \u043A\u043B\u0430\u0441\u0441\u0430\u043C: \u0432\u044B \u043E\u0442\u043A\u0440\u044B\u0432\u0430\u0435\u0442\u0435 \u0436\u0443\u0440\u043D\u0430\u043B \u043A\u0430\u0436\u0434\u043E\u0433\u043E \u043A\u043B\u0430\u0441\u0441\u0430 \u2014 \u043F\u0440\u043E\u0433\u0440\u0430\u043C\u043C\u0430 \u0441\u0432\u0435\u0440\u044F\u0435\u0442 \u044D\u043A\u0440\u0430\u043D \u0438 \u043D\u0430\u0431\u0438\u0440\u0430\u0435\u0442 \u043E\u0446\u0435\u043D\u043A\u0438"
+  }, "\u2328 \u0412\u0435\u0447\u0435\u0440\u043D\u0438\u0439 \u043D\u0430\u0431\u043E\u0440 \u0432 \u0436\u0443\u0440\u043D\u0430\u043B (\u043E\u0447\u0435\u0440\u0435\u0434\u044C \u043F\u043E \u043A\u043B\u0430\u0441\u0441\u0430\u043C)")), queueOpen && /*#__PURE__*/React.createElement(EntryQueueModal, {
+    data: data,
+    update: update,
+    onClose: () => setQueueOpen(false)
+  }), groupList.length === 0 ? /*#__PURE__*/React.createElement("div", {
     className: "qrow",
     style: {
       cursor: "default",
@@ -14995,6 +15873,7 @@ function JournalSection({
   const [reportDate, setReportDate] = useState(null);
   const [addMarkOpen, setAddMarkOpen] = useState(false);
   const [xlsxOpen, setXlsxOpen] = useState(false);
+  const [autoTypeOpen, setAutoTypeOpen] = useState(false);
   const [newQuarterOpen, setNewQuarterOpen] = useState(false);
   const [hoverCell, setHoverCell] = useState(null);
   const [hoverMark, setHoverMark] = useState(null);
@@ -15687,7 +16566,15 @@ function JournalSection({
   }, /*#__PURE__*/React.createElement(Icon, {
     name: "folder",
     size: 12
-  }), " \u0418\u043C\u043F\u043E\u0440\u0442 \u0438\u0437 \u044D\u043B. \u0436\u0443\u0440\u043D\u0430\u043B\u0430 (.xlsx)"), /*#__PURE__*/React.createElement(Btn, {
+  }), " \u0418\u043C\u043F\u043E\u0440\u0442 \u0438\u0437 \u044D\u043B. \u0436\u0443\u0440\u043D\u0430\u043B\u0430 (.xlsx)"), students.length > 0 && !!(window.litAPI && window.litAPI.autoTypeQueue) && /*#__PURE__*/React.createElement(Btn, {
+    kind: "ghost",
+    sm: true,
+    onClick: () => setAutoTypeOpen(true),
+    title: "\u041F\u0440\u043E\u0433\u0440\u0430\u043C\u043C\u0430 \u0441\u0430\u043C\u0430 \u043D\u0430\u0431\u0435\u0440\u0451\u0442 \u043D\u0435\u0432\u043D\u0435\u0441\u0451\u043D\u043D\u044B\u0435 \u043E\u0446\u0435\u043D\u043A\u0438 \u0432 \u0448\u043A\u043E\u043B\u044C\u043D\u044B\u0439 \u044D\u043B\u0435\u043A\u0442\u0440\u043E\u043D\u043D\u044B\u0439 \u0436\u0443\u0440\u043D\u0430\u043B (\xAB\u041C\u043E\u044F \u0448\u043A\u043E\u043B\u0430\xBB) \u0441\u0442\u043E\u043B\u0431\u0446\u043E\u043C \u043F\u043E \u0434\u0430\u0442\u0430\u043C"
+  }, /*#__PURE__*/React.createElement(Icon, {
+    name: "plus",
+    size: 12
+  }), " \u2328 \u0410\u0432\u0442\u043E\u043D\u0430\u0431\u043E\u0440 \u0432 \u0436\u0443\u0440\u043D\u0430\u043B"), /*#__PURE__*/React.createElement(Btn, {
     kind: "ghost",
     sm: true,
     disabled: !jui.canUndo,
@@ -15886,6 +16773,14 @@ function JournalSection({
     data: data,
     update: update,
     onClose: () => setXlsxOpen(false)
+  }), autoTypeOpen && /*#__PURE__*/React.createElement(EntryQueueModal, {
+    data: data,
+    update: update,
+    focus: {
+      kind,
+      value
+    },
+    onClose: () => setAutoTypeOpen(false)
   }), reportDate && /*#__PURE__*/React.createElement(JournalDateReportModal, {
     data: data,
     students: students,
