@@ -1183,7 +1183,20 @@ function migrateState(raw) {
     name: c.name || "",
     color: c.color || SWATCHES[Math.floor(Math.random() * SWATCHES.length)]
   }));
-  d.reserves = Array.isArray(d.reserves) ? d.reserves : [];
+  // Запас: упражнения и карточки (персоналии/произведения/теория). Старые записи (только exerciseId) становятся type:"exercise".
+  d.reserves = Array.isArray(d.reserves) ? d.reserves.map(r => {
+    const type = r.type || "exercise";
+    const refId = r.refId != null ? r.refId : r.exerciseId;
+    return {
+      ...r,
+      type,
+      refId,
+      classLetterId: r.classLetterId || null,
+      ...(type === "exercise" ? {
+        exerciseId: refId
+      } : {})
+    };
+  }) : [];
   d.materialsForArticles = d.materialsForArticles || [];
   d.classLetters = (d.classLetters || []).map(cl => ({
     id: cl.id || uid(),
@@ -6081,6 +6094,92 @@ function stripQaAnchors(d, entityType, entityId, qid) {
   });
   if (entityType === "exercise") ent.text = doc.body.innerHTML;else if (ent.course) ent.course.lectureHtml = doc.body.innerHTML;
 }
+// ---- Запас: упражнения и карточки урока, убранные «на потом» для класса/литеры/курса ----
+// Запись: { id, groupKind: "class"|"course", groupValue, classLetterId, type: "exercise"|"theory"|"personality"|"work", refId,
+//           exerciseId (только у упражнений), hasWhole, note, qItems: [{ questionId, local, note }] } — вопросы урока запоминаются и возвращаются вместе с материалом.
+function reserveObjOf(data, r) {
+  const meta = ITEM_TYPE_META[r.type || "exercise"];
+  return meta ? (data[meta.dataKey] || []).find(e => e.id === (r.refId != null ? r.refId : r.exerciseId)) || null : null;
+}
+function reserveTitleOf(data, r) {
+  const o = reserveObjOf(data, r);
+  return o ? ITEM_TYPE_META[r.type || "exercise"].titleOf(data, o) : "(удалено)";
+}
+function lessonReserveScope(l) {
+  return {
+    groupKind: l.courseId ? "course" : "class",
+    groupValue: l.courseId || l.class,
+    classLetterId: l.classLetterId || null
+  };
+}
+// Запас, доступный уроку: его литеры и общий запас класса (без литеры).
+function reservesForLesson(data, l) {
+  const sc = lessonReserveScope(l);
+  return (data.reserves || []).filter(r => r.groupKind === sc.groupKind && r.groupValue === sc.groupValue && (!r.classLetterId || r.classLetterId === sc.classLetterId));
+}
+// Убирает материал из урока и кладёт в запас (внутри update). Вопросы урока к этому материалу запоминаются.
+function putMaterialToReserve(d, lessonId, type, refId) {
+  const l = d.lessons.find(x => x.id === lessonId);
+  if (!l) return;
+  const mine = l.items.filter(it => it.type === type && it.refId === refId || it.type === "question" && it.entityType === type && it.entityId === refId);
+  const whole = mine.find(it => it.type === type);
+  const qItems = mine.filter(it => it.type === "question").map(it => ({
+    questionId: it.questionId,
+    local: it.local || null,
+    note: it.note || ""
+  }));
+  l.items = l.items.filter(it => !mine.includes(it));
+  const sc = lessonReserveScope(l);
+  const entry = {
+    id: uid(),
+    ...sc,
+    type,
+    refId,
+    ...(type === "exercise" ? {
+      exerciseId: refId
+    } : {}),
+    hasWhole: type === "exercise" ? true : !!whole,
+    note: whole ? whole.note || "" : "",
+    qItems
+  };
+  const old = d.reserves.findIndex(r => r.groupKind === sc.groupKind && r.groupValue === sc.groupValue && (r.classLetterId || null) === sc.classLetterId && (r.type || "exercise") === type && (r.refId != null ? r.refId : r.exerciseId) === refId);
+  if (old >= 0) {
+    entry.id = d.reserves[old].id;
+    d.reserves[old] = entry;
+  } else d.reserves.push(entry);
+}
+// Достаёт запись из запаса в урок (внутри update); запись из запаса удаляется. Возвращает true, если получилось.
+function takeReserveToLesson(d, lessonId, reserveId) {
+  const r = d.reserves.find(x => x.id === reserveId);
+  const l = d.lessons.find(x => x.id === lessonId);
+  if (!r || !l) return false;
+  const type = r.type || "exercise";
+  const refId = r.refId != null ? r.refId : r.exerciseId;
+  const qItems = Array.isArray(r.qItems) ? r.qItems : [];
+  if ((type === "exercise" || r.hasWhole !== false || qItems.length === 0) && !l.items.some(it => it.type === type && it.refId === refId)) {
+    l.items.push(migrateLessonItem({
+      type,
+      refId,
+      note: r.note || ""
+    }));
+  }
+  const ent = (d[ITEM_TYPE_META[type].dataKey] || []).find(e => e.id === refId);
+  qItems.forEach(q => {
+    if (l.items.some(it => it.type === "question" && it.questionId === q.questionId)) return;
+    if (!q.local && !(ent && entityQuestionsOf(ent, type).some(x => x.id === q.questionId))) return;
+    l.items.push(migrateLessonItem({
+      type: "question",
+      entityType: type,
+      entityId: refId,
+      questionId: q.questionId,
+      local: q.local || null,
+      note: q.note || ""
+    }));
+  });
+  d.reserves = d.reserves.filter(x => x.id !== reserveId);
+  return true;
+}
+
 // Список учеников, вызванных к доске за конкретный элемент урока (упражнение/вопрос) — можно
 // сразу несколько; каждая запись хранит своё markId, чтобы правило ту же отметку, а не плодило новые.
 function itemStudents(item) {
@@ -7990,7 +8089,8 @@ function EntityMaterialRow({
   onMoveQuestion,
   embedded,
   onPrint,
-  onEdit
+  onEdit,
+  onReserve
 }) {
   const [open, setOpen] = useState(!!embedded);
   const [full, setFull] = useState(false);
@@ -8347,7 +8447,15 @@ function EntityMaterialRow({
     }
   }, meta.titleOf(data, entity)), questionItemsList.length > 0 && /*#__PURE__*/React.createElement("span", {
     className: "hint"
-  }, questionItemsList.length, " \u0432\u043E\u043F\u0440."), open && fullBtn, onEdit && /*#__PURE__*/React.createElement(Btn, {
+  }, questionItemsList.length, " \u0432\u043E\u043F\u0440."), open && fullBtn, onReserve && /*#__PURE__*/React.createElement(Btn, {
+    kind: "ghost",
+    sm: true,
+    onClick: e => {
+      e.stopPropagation();
+      onReserve();
+    },
+    title: "\u0412 \u0437\u0430\u043F\u0430\u0441: \u0443\u0431\u0440\u0430\u0442\u044C \u0438\u0437 \u0443\u0440\u043E\u043A\u0430, \u043D\u0435 \u0443\u0434\u0430\u043B\u044F\u044F (\u043A\u0430\u0440\u0442\u043E\u0447\u043A\u0430 \u0438 \u0432\u043E\u043F\u0440\u043E\u0441\u044B \u0443\u0440\u043E\u043A\u0430 \u0441\u043E\u0445\u0440\u0430\u043D\u044F\u0442\u0441\u044F \u0432 \u0437\u0430\u043F\u0430\u0441\u0435)"
+  }, "\u21C4"), onEdit && /*#__PURE__*/React.createElement(Btn, {
     kind: "ghost",
     sm: true,
     onClick: e => {
@@ -9267,19 +9375,27 @@ function LessonPage({
     setCopyLettersOpen(false);
     setCopyLettersChecked([]);
   };
-  const moveToReserve = item => update(d => {
-    const l = d.lessons.find(x => x.id === lessonId);
-    l.items = l.items.filter(it => it.id !== item.id && !(item.type === "exercise" && it.type === "question" && it.entityType === "exercise" && it.entityId === item.refId));
-    const groupKind = l.class ? "class" : "course";
-    const groupValue = l.class || l.courseId;
-    if (item.type === "exercise" && !d.reserves.some(r => r.exerciseId === item.refId && r.groupKind === groupKind && r.groupValue === groupValue)) {
-      d.reserves.push({
-        id: uid(),
-        groupKind,
-        groupValue,
-        exerciseId: item.refId
-      });
-    }
+  // «В запас»: упражнение или карточка (персоналия / произведение / теория) уходит из урока в запас этого класса/литеры/курса
+  const moveToReserve = item => {
+    update(d => {
+      putMaterialToReserve(d, lessonId, item.type, item.refId);
+      return d;
+    });
+    showToast("Убрано в запас — внизу страницы урока");
+  };
+  const reserveGroup = g => {
+    update(d => {
+      putMaterialToReserve(d, lessonId, g.entityType, g.entityId);
+      return d;
+    });
+    showToast("Карточка убрана в запас — внизу страницы урока");
+  };
+  const takeFromReserve = rid => update(d => {
+    takeReserveToLesson(d, lessonId, rid);
+    return d;
+  });
+  const dropReserve = rid => update(d => {
+    d.reserves = d.reserves.filter(r => r.id !== rid);
     return d;
   });
   const removeLesson = async () => {
@@ -9601,7 +9717,8 @@ function LessonPage({
             mode: "edit",
             type: g.entityType,
             id: g.entityId
-          })
+          }),
+          onReserve: () => reserveGroup(g)
         })));
       }
       const it = bl.items[0];
@@ -9775,7 +9892,72 @@ function LessonPage({
     size: 12
   }), " \uD83D\uDDA8 \u041F\u0435\u0447\u0430\u0442\u044C / \u0441\u043A\u0430\u0447\u0430\u0442\u044C \u0414\u0417"), /*#__PURE__*/React.createElement("span", {
     className: "hint"
-  }, "\u0414\u0417 \u043C\u043E\u0436\u043D\u043E \u043D\u0430\u043F\u0435\u0447\u0430\u0442\u0430\u0442\u044C \u043F\u043E \u043D\u0435\u0441\u043A\u043E\u043B\u044C\u043A\u043E \u043A\u043E\u043F\u0438\u0439 \u043D\u0430 \u043B\u0438\u0441\u0442\u0435; \u0438\u0437\u043E\u0431\u0440\u0430\u0436\u0435\u043D\u0438\u044F \u0414\u0417 \u2014 \u0442\u043E\u0436\u0435."))), /*#__PURE__*/React.createElement("div", {
+  }, "\u0414\u0417 \u043C\u043E\u0436\u043D\u043E \u043D\u0430\u043F\u0435\u0447\u0430\u0442\u0430\u0442\u044C \u043F\u043E \u043D\u0435\u0441\u043A\u043E\u043B\u044C\u043A\u043E \u043A\u043E\u043F\u0438\u0439 \u043D\u0430 \u043B\u0438\u0441\u0442\u0435; \u0438\u0437\u043E\u0431\u0440\u0430\u0436\u0435\u043D\u0438\u044F \u0414\u0417 \u2014 \u0442\u043E\u0436\u0435."))), (() => {
+    const items = reservesForLesson(data, lesson);
+    const letterName = r => r.classLetterId ? lesson.class + classLetterName(data, r.classLetterId) : "";
+    return /*#__PURE__*/React.createElement("div", {
+      className: "panel",
+      style: {
+        marginTop: 16
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "panel-head"
+    }, /*#__PURE__*/React.createElement("h2", null, "\u0417\u0430\u043F\u0430\u0441 \u2014 ", lessonPlaceLabel(lesson, data), items.length ? " (" + items.length + ")" : "")), /*#__PURE__*/React.createElement("div", {
+      className: "panel-body"
+    }, items.length === 0 && /*#__PURE__*/React.createElement("div", {
+      className: "muted",
+      style: {
+        fontSize: 13
+      }
+    }, "\u041F\u0443\u0441\u0442\u043E. \u041D\u0430\u0436\u043C\u0438\u0442\u0435 \xAB\u21C4\xBB \u0443 \u0443\u043F\u0440\u0430\u0436\u043D\u0435\u043D\u0438\u044F \u0438\u043B\u0438 \u043A\u0430\u0440\u0442\u043E\u0447\u043A\u0438 \u0432 \u044D\u0442\u043E\u043C \u0443\u0440\u043E\u043A\u0435 \u2014 \u043C\u0430\u0442\u0435\u0440\u0438\u0430\u043B \u0443\u0439\u0434\u0451\u0442 \u0441\u044E\u0434\u0430, \u0438 \u0435\u0433\u043E \u043C\u043E\u0436\u043D\u043E \u0431\u0443\u0434\u0435\u0442 \u0432\u0435\u0440\u043D\u0443\u0442\u044C \u0432 \u044D\u0442\u043E\u0442 \u0438\u043B\u0438 \u0434\u0440\u0443\u0433\u043E\u0439 \u0443\u0440\u043E\u043A."), items.map(r => {
+      const obj = reserveObjOf(data, r);
+      const type = r.type || "exercise";
+      const nq = Array.isArray(r.qItems) ? r.qItems.length : 0;
+      const here = lesson.items.some(it => it.type === type && it.refId === (r.refId != null ? r.refId : r.exerciseId));
+      return /*#__PURE__*/React.createElement("div", {
+        key: r.id,
+        className: "row",
+        style: {
+          padding: "6px 0",
+          borderBottom: "1px solid var(--line)",
+          gap: 8
+        }
+      }, /*#__PURE__*/React.createElement("span", {
+        className: "chip",
+        style: {
+          flex: "none"
+        }
+      }, ITEM_TYPE_META[type].label), /*#__PURE__*/React.createElement("div", {
+        style: {
+          flex: 1,
+          minWidth: 0,
+          fontSize: 13,
+          cursor: obj ? "pointer" : "default"
+        },
+        onClick: () => obj && setPeek({
+          type,
+          refId: r.refId != null ? r.refId : r.exerciseId
+        })
+      }, reserveTitleOf(data, r), nq > 0 && /*#__PURE__*/React.createElement("span", {
+        className: "hint"
+      }, " \xB7 \u0432\u043E\u043F\u0440\u043E\u0441\u043E\u0432 \u0443\u0440\u043E\u043A\u0430: ", nq), letterName(r) && /*#__PURE__*/React.createElement("span", {
+        className: "hint"
+      }, " \xB7 ", letterName(r)), !r.classLetterId && lesson.classLetterId && /*#__PURE__*/React.createElement("span", {
+        className: "hint"
+      }, " \xB7 \u043E\u0431\u0449\u0438\u0439 \u0437\u0430\u043F\u0430\u0441 \u043A\u043B\u0430\u0441\u0441\u0430")), obj && /*#__PURE__*/React.createElement(Btn, {
+        kind: "primary",
+        sm: true,
+        disabled: here,
+        onClick: () => takeFromReserve(r.id),
+        title: here ? "Уже стоит в этом уроке" : "Вернуть в этот урок (запись из запаса исчезнет)"
+      }, here ? "✓ в уроке" : "+ В этот урок"), /*#__PURE__*/React.createElement(Btn, {
+        kind: "ghost",
+        sm: true,
+        onClick: () => dropReserve(r.id),
+        title: "\u0423\u0431\u0440\u0430\u0442\u044C \u0438\u0437 \u0437\u0430\u043F\u0430\u0441\u0430 (\u0441\u0430\u043C \u043C\u0430\u0442\u0435\u0440\u0438\u0430\u043B \u043E\u0441\u0442\u0430\u0451\u0442\u0441\u044F \u0432 \u0431\u0430\u0437\u0435)"
+      }, "\u0423\u0431\u0440\u0430\u0442\u044C \u0438\u0437 \u0437\u0430\u043F\u0430\u0441\u0430"));
+    })));
+  })(), /*#__PURE__*/React.createElement("div", {
     className: "row wrap",
     style: {
       marginTop: 16,
@@ -10973,44 +11155,48 @@ function ReservePool({
   const items = data.reserves.filter(r => r.groupKind === groupKind && r.groupValue === groupValue);
   if (items.length === 0) return null;
   const addToLesson = (reserveId, lessonId) => update(d => {
-    const r = d.reserves.find(x => x.id === reserveId);
-    if (!r) return d;
-    const l = d.lessons.find(x => x.id === lessonId);
-    if (l && !l.items.some(it => it.type === "exercise" && it.refId === r.exerciseId)) l.items.push({
-      id: uid(),
-      type: "exercise",
-      refId: r.exerciseId,
-      note: ""
-    });
-    d.reserves = d.reserves.filter(x => x.id !== reserveId);
+    takeReserveToLesson(d, lessonId, reserveId);
     return d;
   });
   const removeReserve = id => update(d => {
     d.reserves = d.reserves.filter(r => r.id !== id);
     return d;
   });
-  const lessonsHere = data.lessons.filter(l => (groupKind === "class" ? l.class === groupValue : l.courseId === groupValue) && !l.archived);
+  const lessonsAll = data.lessons.filter(l => (groupKind === "class" ? l.class === groupValue && !l.courseId : l.courseId === groupValue) && !l.archived);
   return /*#__PURE__*/React.createElement("div", {
     className: "panel"
   }, /*#__PURE__*/React.createElement("div", {
     className: "panel-head"
-  }, /*#__PURE__*/React.createElement("h2", null, "\u0417\u0430\u043F\u0430\u0441\u043D\u044B\u0435 \u0443\u043F\u0440\u0430\u0436\u043D\u0435\u043D\u0438\u044F")), /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement("h2", null, "\u0417\u0430\u043F\u0430\u0441 ", /*#__PURE__*/React.createElement("span", {
+    className: "hint"
+  }, "(\u0443\u043F\u0440\u0430\u0436\u043D\u0435\u043D\u0438\u044F \u0438 \u043A\u0430\u0440\u0442\u043E\u0447\u043A\u0438, \u0443\u0431\u0440\u0430\u043D\u043D\u044B\u0435 \u0438\u0437 \u0443\u0440\u043E\u043A\u043E\u0432)"))), /*#__PURE__*/React.createElement("div", {
     className: "panel-body"
   }, items.map(r => {
-    const ex = data.examples.find(e => e.id === r.exerciseId);
+    const type = r.type || "exercise";
+    const letter = r.classLetterId ? groupValue + classLetterName(data, r.classLetterId) : "";
+    const lessonsHere = lessonsAll.filter(l => !r.classLetterId || (l.classLetterId || null) === r.classLetterId);
     return /*#__PURE__*/React.createElement("div", {
       key: r.id,
       className: "row",
       style: {
         padding: "6px 0",
-        borderBottom: "1px solid var(--line)"
+        borderBottom: "1px solid var(--line)",
+        gap: 8
       }
-    }, /*#__PURE__*/React.createElement("div", {
+    }, /*#__PURE__*/React.createElement("span", {
+      className: "chip",
+      style: {
+        flex: "none"
+      }
+    }, ITEM_TYPE_META[type].label), /*#__PURE__*/React.createElement("div", {
       style: {
         flex: 1,
-        fontSize: 13
+        fontSize: 13,
+        minWidth: 0
       }
-    }, ex ? stripHtml(ex.text).slice(0, 80) : "(удалено)"), /*#__PURE__*/React.createElement("select", {
+    }, reserveTitleOf(data, r).slice(0, 90), letter && /*#__PURE__*/React.createElement("span", {
+      className: "hint"
+    }, " \xB7 ", letter)), /*#__PURE__*/React.createElement("select", {
       className: "toolselect",
       onChange: e => {
         if (e.target.value) addToLesson(r.id, e.target.value);
@@ -11021,7 +11207,7 @@ function ReservePool({
     }, "\u0412 \u0443\u0440\u043E\u043A\u2026"), lessonsHere.map(l => /*#__PURE__*/React.createElement("option", {
       key: l.id,
       value: l.id
-    }, l.topic || "Без темы"))), /*#__PURE__*/React.createElement(Btn, {
+    }, (l.classLetterId ? classLetterName(data, l.classLetterId) + " · " : "") + (l.topic || "Без темы")))), /*#__PURE__*/React.createElement(Btn, {
       kind: "ghost",
       sm: true,
       onClick: () => removeReserve(r.id)
@@ -18640,6 +18826,7 @@ function EntityPage({
     if (!(await Confirm(`Удалить «${entity.title || "без названия"}»? Действие необратимо.`))) return;
     update(d => {
       d[cfg.key] = d[cfg.key].filter(e => e.id !== id);
+      d.reserves = (d.reserves || []).filter(r => (r.refId != null ? r.refId : r.exerciseId) !== id);
       if (cfg.key === "personalities") d.works.forEach(w => {
         if (w.authorId === id) w.authorId = null;
       });
